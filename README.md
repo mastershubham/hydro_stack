@@ -4,7 +4,7 @@ Generic pipeline that runs standard hydrology algorithms for a given area of int
 ## Setup for end user
 
 1. Install Docker.
-2. Pull the image from dockerhub.
+2. Pull the image from DockerHub.
 ```
 docker pull shubham8625/hydro-pipeline:latest
 ```

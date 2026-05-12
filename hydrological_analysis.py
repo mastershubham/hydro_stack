@@ -379,7 +379,7 @@ def compute_catchments_with_stream_order(
 
     # For each basin keep the segment with the highest cell count
     # (handles the rare case where two segments clip the same basin).
-    basin_to_seg: dict[int, tuple[int, int]] = {}   # basin_id → (seg_id, count)
+    basin_to_seg: dict[int, tuple[int, int]] = {}   # basin_id -> (seg_id, count)
     for line in cross_raw.strip().splitlines():
         parts = line.split()
         if len(parts) != 3:
@@ -448,12 +448,12 @@ def compute_catchments_with_stream_order(
         map=output_vector,
         columns="strahler_order int",
     )
-
+    
     gs.run_command(
-        "v.db.update",
+        "v.db.renamecolumn",
         map=output_vector,
-        column="strahler_order",
-        query_column="cat",)
+        column="value,strahler_order"
+    )
 
     gs.run_command("g.remove", type="raster", name=temp_order_rast, flags="f")
 

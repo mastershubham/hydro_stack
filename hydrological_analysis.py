@@ -443,12 +443,7 @@ def compute_catchments_with_stream_order(
         flags="s",                # -s: smooth
         overwrite=True,
     )
-    gs.run_command(
-        "v.db.addcolumn",
-        map=output_vector,
-        columns="strahler_order int",
-    )
-    
+
     gs.run_command(
         "v.db.renamecolumn",
         map=output_vector,

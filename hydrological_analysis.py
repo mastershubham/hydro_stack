@@ -35,7 +35,8 @@ import numpy as np
 import math
 
 
-MIN_WATERSHED_SIZE = 5555 # Translates to roughly 500 hectares at 30m resolution (500 * 10000 / (30*30) = 5555 cells)
+MIN_WATERSHED_SIZE = 500 # 500 hectares
+HYPER_PARAM = 1000 # Initial threshold for r.watershed. 1000 cells. 
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -59,7 +60,7 @@ def parse_args():
     )
     parser.add_argument(
         "--min_watershed_size", type=int, default=MIN_WATERSHED_SIZE,
-        help="Minimum watershed size in cells (default: 5555 cells, ~500 hectares at 30m resolution)"
+        help="Minimum watershed size in cells (default: 500 hectares)"
     )
 
     return parser.parse_args()
@@ -142,17 +143,33 @@ def natural_depressions(dem_filled, dem_original):
     gs.run_command("r.mapcalc", expr=f"{dep_map} = {dem_filled} - {dem_original}", overwrite=True)
     return dep_map
 
-def calculate_flow_accumulation(dem_filled, threshold):
+def calculate_flow_accumulation(dem_filled, hyperparam_threshold, size_threshold):
     import grass.script as gs
     gs.run_command("r.watershed", 
                 elevation=dem_filled, 
                 accumulation="flow_acc", 
                 drainage="flow_dir_watershed",
-                threshold=threshold,
+                threshold=hyperparam_threshold, 
                 basin="micro_watersheds",
                 #stream="streams_raw",
                 flags="as",          # -a: positive accumulation; -s: single-flow (D8) 
                 overwrite=True)
+    
+    gs.run_command("r.reclass.area",
+                input="micro_watersheds",
+                output="micro_watersheds_filtered",
+                value=size_threshold, 
+                mode="lesser",
+                method="rmarea",
+                overwrite=True)
+
+    gs.run_command("g.remove",
+                type="raster",
+                name="micro_watersheds",
+                flags="f")
+
+    gs.run_command("g.rename",
+                raster=("micro_watersheds_filtered", "micro_watersheds"))
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
 
 
@@ -575,7 +592,9 @@ def main():
     depressions = natural_depressions(dem_filled, "dem_utm")
     
     
-    flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation(dem_filled, args.min_watershed_size)
+    flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation(dem_filled,
+                                                                                   hyperparam_threshold=HYPER_PARAM,
+                                                                                   size_threshold=args.min_watershed_size)
 
     gs.run_command("r.stream.extract",
                elevation=dem_filled,
@@ -623,11 +642,8 @@ def main():
             columns=",".join(drop_cols)
         )
         print(f"Dropped columns: {drop_cols}")
-    gs.run_command("r.to.vect",
-            input="micro_watersheds",
-            output="watersheds_vect",
-            type="area",
-            overwrite=True)
+
+    
 
     pour_points_vect = compute_pour_points(
         micro_watersheds_rast=micro_watersheds,
@@ -640,8 +656,6 @@ def main():
         dem_rast=dem_filled,
         output_rast="catchment_area_m2"
     )
- 
-    gs.run_command("r.mask", flags="r")
     
     catchments_vect = compute_catchments_with_stream_order(
         micro_watersheds_rast=micro_watersheds,   
@@ -660,6 +674,13 @@ def main():
         type="area",
         overwrite=True,
     )
+
+    gs.run_command("r.to.vect",
+            input=micro_watersheds,
+            output="watersheds_vect",
+            type="area",
+            overwrite=True)
+
     edges, basin_centroids, basin_ids = compute_mws_connectivity(
         micro_watersheds_rast=micro_watersheds,
         flow_dir_rast=flow_dir_ws,
@@ -667,17 +688,21 @@ def main():
         output_geojson=Path(args.output) / "mws_connectivity.geojson"
     )
     
+    gs.run_command(
+        "v.db.addcolumn",
+        map="watersheds_vect",
+        columns="basin_id int, downstream_id int, upstream_ids varchar(256), flow_direction double precision")
+    
+    gs.run_command("v.db.update", map="watersheds_vect", column="basin_id", query_column="value")
+
+
     from collections import defaultdict
     downstream_map = {from_id: to_id for (from_id, to_id) in edges}
     upstream_map   = defaultdict(list)
     for from_id, to_id in edges:
         upstream_map[to_id].append(from_id)
- 
-    gs.run_command(
-        "v.db.addcolumn",
-        map="watersheds_vect",
-        columns="downstream_id int, upstream_ids varchar(256), flow_direction double precision",
-    )
+
+    
     for bid in map(int, basin_ids):
         ds = downstream_map.get(bid)
         us = upstream_map.get(bid, [])
@@ -688,15 +713,16 @@ def main():
             bearing = round(math.degrees(math.atan2(dx, dy)) % 360, 2)
         if ds is not None:
             gs.run_command("v.db.update", map="watersheds_vect",
-                           column="downstream_id", value=str(ds), where=f"cat={bid}")
+                           column="downstream_id", value=str(ds), where=f"basin_id={bid}")
         if us:
             gs.run_command("v.db.update", map="watersheds_vect",
-                           column="upstream_ids", value=",".join(map(str, us)), where=f"cat={bid}")
+                           column="upstream_ids", value=",".join(map(str, us)), where=f"basin_id={bid}")
         if bearing is not None:
             gs.run_command("v.db.update", map="watersheds_vect",
-                           column="flow_direction", value=str(bearing), where=f"cat={bid}")
-    print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction → 'watersheds_vect'")
+                           column="flow_direction", value=str(bearing), where=f"basin_id={bid}")
+    print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
 
+    gs.run_command("r.mask", flags="r")
     rasters_to_export = {
             "dem_filled":           dem_filled,
             "flow_direction":       flow_dir_ws,

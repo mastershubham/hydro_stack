@@ -541,8 +541,6 @@ def main():
     
     name_of_proj = Path(args.output).resolve().name
     session = setup_grass_session(args.grassdb, epsg, name_of_proj)
-    if session:
-        session.close()
     
     import grass.script as gs
 
@@ -738,6 +736,9 @@ def main():
             "microwatersheds":      ("watersheds_vect", "area"),
         }
     export_outputs(args.output, rasters_to_export, vectors_to_export)
+
+    if session:
+        session.close()
 
 if __name__ == "__main__":
     main()

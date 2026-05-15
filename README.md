@@ -15,16 +15,8 @@ cd hydro_stack
 ```
 4. Run the pipeline after mounting the data and the necessary files/folders into the container.
 ```
-docker run --rm \
-    -v ./data:/app/data \
-    -v ~/grassdata:/root/grassdata \
-    -v ./masalia:/app/masalia \
-    -w /app \
-    shubham8625/hydro-pipeline:latest \
-    python3 hydrological_analysis.py \
-        --shp ./data/masalia_tehsil_boundary.shp \
-        --output masalia \
-        --grassdb /root/grassdata
+docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
+python hydrological_analysis.py --shp ./data/masalia_tehsil_boundary.shp --output masalia --grassdb ~/grassdata
 ```
 
 ## Setup for Developers
@@ -48,16 +40,8 @@ Put up the data somewhere preferably under hydro_stack or some folder under it.
 
 Now run the command as:
 ```
-docker run --rm \
-    -v ./data:/app/data \
-    -v ~/grassdata:/root/grassdata \
-    -v ./masalia:/app/masalia \
-    -w /app \
-    <name_of_the_image> \
-    python3 hydrological_analysis.py \
-        --shp ./data/masalia_tehsil_boundary.shp \
-        --output masalia \
-        --grassdb /root/grassdata
+docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
+python hydrological_analysis.py --shp ./data/masalia_tehsil_boundary.shp --output masalia --grassdb ~/grassdata
 ```
 
 ## Visualizing Micro-watershed connectivity

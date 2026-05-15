@@ -189,7 +189,7 @@ def compute_pour_points(micro_watersheds_rast: str,
 
     gs.run_command(
         "r.mapcalc",
-        expr="micro_watersheds_int = int(micro_watersheds)",
+        expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
         overwrite=True
     )
 
@@ -205,7 +205,8 @@ def compute_pour_points(micro_watersheds_rast: str,
         if not mask.any():
             continue
         local_acc = np.where(mask, acc_arr, -np.inf)
-        row, col  = np.unravel_index(np.argmax(local_acc), local_acc.shape)
+        flat_idx      = np.argmax(local_acc)
+        row, col      = np.unravel_index(flat_idx, local_acc.shape)
         max_acc   = float(acc_arr[row, col])
     
         x = w + (col + 0.5) * ewres

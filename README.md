@@ -57,6 +57,7 @@ docker run --rm \
     python3 hydrological_analysis.py \
         --shp ./data/masalia_tehsil_boundary.shp \
         --output masalia \
+        --grassdb /root/grassdata
 ```
 
 ## Visualizing Micro-watershed connectivity
@@ -68,9 +69,4 @@ docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
 Then run the visualization script for micro-watershed connectivity.
 ```
 python visualise_mws_connectivity.py
-```
-
-
-
-        --grassdb /root/grassdata
 ```

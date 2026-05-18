@@ -133,7 +133,7 @@ def plot_watersheds(gdf, connectivity, pour_points, id_field, from_field, to_fie
 
     out_png = "watershed_connectivity.png"
     plt.savefig(out_png, dpi=150, bbox_inches="tight")
-    print(f"Saved → {out_png}")
+    print(f"Saved: {out_png}")
     plt.show()
 
 

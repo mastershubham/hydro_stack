@@ -24,6 +24,7 @@ COPY requirements.txt .
 
 RUN grass -c EPSG:4326 /tmp/grass_install -e && \
     grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.order && \
+    grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.basins && \
     rm -rf /tmp/grass_install
 
 RUN python3 -m venv /opt/venv --system-site-packages

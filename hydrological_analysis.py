@@ -374,105 +374,71 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
 
 
 def compute_catchments_with_stream_order(
-    micro_watersheds_rast: str,
     streams_rast: str,
     strahler_rast: str,
-    flow_acc_rast: str,
-    output_vector: str = "catchments_with_order"
+    flow_dir_rast: str,
+    output_rast: str = "catchment_stream_order"
 ) -> str:
-   
+  
     import grass.script as gs
-    from grass.script import array as garray
     import tempfile, os
-    import numpy as np
 
-    print("Catchments with stream order: building …")
-
-    cross_raw = gs.read_command(
-        "r.stats",
-        input=f"{micro_watersheds_rast},{streams_rast}",
-        flags="cn",          # -c: cell counts, -n: skip nulls
-        separator="space",
+    seg_basins_rast = "tmp_seg_basins"
+    gs.run_command(
+        "r.stream.basins",
+        direction=flow_dir_rast,
+        stream_rast=streams_rast,
+        basins=seg_basins_rast,
+        overwrite=True
     )
 
-    # For each basin keep the segment with the highest cell count
-    # (handles the rare case where two segments clip the same basin).
-    basin_to_seg: dict[int, tuple[int, int]] = {}   # basin_id -> (seg_id, count)
-    for line in cross_raw.strip().splitlines():
-        parts = line.split()
-        if len(parts) != 3:
-            continue
-        basin_id, seg_id, count = int(parts[0]), int(parts[1]), int(parts[2])
-        if basin_id not in basin_to_seg or count > basin_to_seg[basin_id][1]:
-            basin_to_seg[basin_id] = (seg_id, count)
-
-    order_raw = gs.read_command(
+    raw = gs.read_command(
         "r.stats",
         input=f"{streams_rast},{strahler_rast}",
         flags="cn",
-        separator="space",
+        separator="space"
     )
 
     seg_to_order: dict[int, int] = {}
-    for line in order_raw.strip().splitlines():
+    for line in raw.strip().splitlines():
         parts = line.split()
         if len(parts) >= 2:
             seg_to_order[int(parts[0])] = int(parts[1])
 
     if not seg_to_order:
         raise RuntimeError(
-            "No Strahler order values found — check that streams_rast "
+            f"No Strahler order values found — check that '{streams_rast}' "
             f"and '{strahler_rast}' overlap spatially."
         )
 
-    basin_to_order: dict[int, int] = {}
-    unmatched = []
-    for basin_id, (seg_id, _) in basin_to_seg.items():
-        if seg_id in seg_to_order:
-            basin_to_order[basin_id] = seg_to_order[seg_id]
-        else:
-            unmatched.append(basin_id)
-
-    if unmatched:
-        print(f"  [WARN] {len(unmatched)} basins had no matching stream order "
-              f"(headwater slivers?) — they will be NULL in output.")
-
-    temp_order_rast = "tmp_catchment_strahler"
-    rules_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-    for basin_id, order in basin_to_order.items():
-        rules_file.write(f"{basin_id} = {order}\n")
+    rules_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False
+    )
+    for seg_id, order in seg_to_order.items():
+        rules_file.write(f"{seg_id} = {order}\n")
     rules_file.write("* = NULL\n")
     rules_file.close()
 
     gs.run_command(
         "r.reclass",
-        input=micro_watersheds_rast,
-        output=temp_order_rast,
+        input=seg_basins_rast,
+        output=output_rast,
         rules=rules_file.name,
-        overwrite=True,
+        overwrite=True
     )
     os.unlink(rules_file.name)
 
-    gs.run_command(
-        "r.to.vect",
-        input=temp_order_rast,
-        output=output_vector,
-        type="area",
-        flags="s",                # -s: smooth
-        overwrite=True,
-    )
+    gs.run_command("g.remove", type="raster", name=seg_basins_rast, flags="f")
 
     gs.run_command(
-        "v.db.renamecolumn",
-        map=output_vector,
-        column="value,strahler_order"
+        "r.support",
+        map=output_rast,
+        title="Catchment stream order",
+        description="Strahler order of the stream segment each cell drains into"
     )
 
-    gs.run_command("g.remove", type="raster", name=temp_order_rast, flags="f")
-
-    print(f"  → '{output_vector}' ready: {len(basin_to_order)} catchment polygons "
-          f"tagged with Strahler order (1–{max(basin_to_order.values())}).")
-    return output_vector
+    print(f"'{output_rast}' ready: each cell = Strahler order of its draining segment.")
+    return output_rast
 
 def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict):
     import grass.script as gs
@@ -656,23 +622,11 @@ def main():
         output_rast="catchment_area_m2"
     )
     
-    catchments_vect = compute_catchments_with_stream_order(
-        micro_watersheds_rast=micro_watersheds,   
-        streams_rast="streams_rast",
-        strahler_rast="strahler_order",
-        flow_acc_rast=flow_accumulation,
-        output_vector="catchments_with_order",
-    )
-
-    gs.run_command(
-        "v.to.rast",
-        input=catchments_vect,
-        output="catchments_strahler_rast",
-        use="attr",
-        attribute_column="strahler_order",
-        type="area",
-        overwrite=True,
-    )
+    catchment_order_rast = compute_catchments_with_stream_order(
+    streams_rast="streams_rast",
+    strahler_rast="strahler_order",
+    flow_dir_rast=flow_dir_ws,
+    output_rast="catchment_stream_order")
 
     gs.run_command("r.to.vect",
             input=micro_watersheds,
@@ -729,7 +683,7 @@ def main():
             "natural_depressions":  depressions,
             "stream_order":         "strahler_order",
             "catchment_area_m2":    catchment_area_rast,
-            "catchments_strahler":  "catchments_strahler_rast"
+            "catchment_stream_order":  catchment_order_rast
         }
     vectors_to_export = {
             "streams":              ("streams_with_order", "line"),

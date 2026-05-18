@@ -217,7 +217,7 @@ def compute_pour_points(micro_watersheds_rast: str,
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
                                       delete=False, newline="")
     writer = csv.writer(tmp)
-    writer.writerow(["basin_id", "x", "y", "flow_acc_val"])  # basin_id first
+    writer.writerow(["basin_id", "x", "y", "flow_acc_val"])  
     writer.writerows(records)
     tmp.close()
 
@@ -228,8 +228,8 @@ def compute_pour_points(micro_watersheds_rast: str,
         format="point",
         separator="comma",
         skip=1,
-        x=2, y=3,        # x is col 2, y is col 3 (1-based)
-        cat=1,           # basin_id (integer) is col 1 → used as category
+        x=2, y=3,        
+        cat=1,     
         columns="basin_id int,x double,y double,flow_acc_val double",
         overwrite=True
     )
@@ -369,7 +369,7 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
     with open(output_geojson, "w") as f:
         json.dump(geojson, f, indent=2)
 
-    print(f"MWS connectivity: {len(features)} directed edges written → {output_geojson}")
+    print(f"MWS connectivity: {len(features)} directed edges written: {output_geojson}")
     return edges, basin_centroids, basin_ids
 
 

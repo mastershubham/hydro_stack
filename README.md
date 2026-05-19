@@ -52,5 +52,5 @@ docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
 ```
 Then run the visualization script for micro-watershed connectivity.
 ```
-python visualise_mws_connectivity.py
+python visualize_mws_connectivity.py
 ```

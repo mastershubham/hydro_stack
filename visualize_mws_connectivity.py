@@ -6,9 +6,9 @@ from matplotlib.patches import FancyArrowPatch
 import numpy as np
 
 
-WATERSHEDS_GEOJSON = "./masalia_v2/microwatersheds.geojson"  
-CONNECTIVITY_GEOJSON = "./masalia_v2/mws_connectivity.geojson"     
-POUR_POINTS_GEOJSON = "./masalia_v2/pour_points.geojson"
+WATERSHEDS_GEOJSON = "./masalia/microwatersheds.geojson"  
+CONNECTIVITY_GEOJSON = "./masalia/mws_connectivity.geojson"     
+POUR_POINTS_GEOJSON = "./masalia/pour_points.geojson"
 
 WATERSHED_ID_FIELD = "basin_id"      
 FROM_FIELD         = "from_basin_id"   

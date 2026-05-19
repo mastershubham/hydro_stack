@@ -175,49 +175,95 @@ def calculate_flow_accumulation(dem_filled, hyperparam_threshold, size_threshold
 
 def compute_pour_points(micro_watersheds_rast: str,
                         flow_acc_rast: str,
-                        output_vector: str = "pour_points") -> str:
+                        flow_dir_rast: str,
+                        output_vector: str = "pour_points") -> tuple[str, dict]:
     import grass.script as gs
     from grass.script import array as garray
+    import tempfile, csv
 
-    print("Pour Points Calculation: Locating outlet cell for each micro-watershed.")
+    print("Pour Points: locating true outlet cell for each micro-watershed …")
 
-    region = gs.region()
-    w     = region["w"]
-    n     = region["n"]
-    ewres = region["ewres"]
-    nsres = region["nsres"]
+    region  = gs.region()
+    nrows   = int(region["rows"])
+    ncols   = int(region["cols"])
+    w       = region["w"]
+    n       = region["n"]
+    ewres   = region["ewres"]
+    nsres   = region["nsres"]
 
-    gs.run_command(
-        "r.mapcalc",
-        expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
-        overwrite=True
-    )
+    DIR_OFFSETS = {
+    1: (-1, +1),  # NE
+    2: (-1,  0),  # N
+    3: (-1, -1),  # NW
+    4: ( 0, -1),  # W
+    5: (+1, -1),  # SW
+    6: (+1,  0),  # S
+    7: (+1, +1),  # SE
+    8: ( 0, +1),  # E
+}
 
+    gs.run_command("r.mapcalc",
+                   expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
+                   overwrite=True)
     basin_arr = garray.array("micro_watersheds_int", null=-9999)
-    acc_arr   = garray.array(flow_acc_rast, null=-1)
+    acc_arr = garray.array(flow_acc_rast, null=-1)
+    flowdir_arr = garray.array(flow_dir_rast, null=0)
 
     basin_ids = np.unique(basin_arr)
     basin_ids = basin_ids[(basin_ids > 0) & (basin_ids != -9999)]
-                            
-    records = []
+
+    pour_pts = {}  
+    records  = []  
+
     for bid in basin_ids:
-        mask = basin_arr == bid
-        if not mask.any():
-            continue
-        local_acc = np.where(mask, acc_arr, -np.inf)
-        flat_idx      = np.argmax(local_acc)
-        row, col      = np.unravel_index(flat_idx, local_acc.shape)
-        max_acc   = float(acc_arr[row, col])
-    
+        bid = int(bid)
+
+        rows_in, cols_in = np.where(basin_arr == bid)
+
+        best_acc = -np.inf
+        best_rc  = None
+
+        for r, c in zip(rows_in, cols_in):
+            direction = int(flowdir_arr[r, c])
+            if direction not in DIR_OFFSETS:
+                if float(acc_arr[r, c]) > best_acc:
+                    best_acc = float(acc_arr[r, c])
+                    best_rc  = (r, c)
+                continue
+
+            dr, dc = DIR_OFFSETS[direction]
+            nr, nc = r + dr, c + dc
+
+            outside = not (0 <= nr < nrows and 0 <= nc < ncols)
+            if outside:
+                if float(acc_arr[r, c]) > best_acc:
+                    best_acc = float(acc_arr[r, c])
+                    best_rc  = (r, c)
+                continue
+
+            downstream_basin = int(basin_arr[nr, nc])
+
+            if downstream_basin != bid and downstream_basin > 0 and downstream_basin != -9999:
+                if float(acc_arr[r, c]) > best_acc:
+                    best_acc = float(acc_arr[r, c])
+                    best_rc  = (r, c)
+
+        # Fallback 
+        if best_rc is None:
+            flat_idx = int(np.argmax(np.where(basin_arr == bid, acc_arr, -np.inf)))
+            best_rc  = (int(flat_idx // ncols), int(flat_idx  % ncols))
+            best_acc = float(acc_arr[best_rc])
+
+        pour_pts[bid] = best_rc
+        row, col = best_rc
         x = w + (col + 0.5) * ewres
         y = n - (row + 0.5) * nsres
-        records.append((int(bid), x, y, max_acc))
+        records.append((bid, x, y, best_acc))
 
-    import tempfile, csv
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
                                       delete=False, newline="")
     writer = csv.writer(tmp)
-    writer.writerow(["basin_id", "x", "y", "flow_acc_val"])  
+    writer.writerow(["basin_id", "x", "y", "flow_acc_val"])
     writer.writerows(records)
     tmp.close()
 
@@ -228,15 +274,15 @@ def compute_pour_points(micro_watersheds_rast: str,
         format="point",
         separator="comma",
         skip=1,
-        x=2, y=3,        
-        cat=1,     
-        columns="basin_id int,x double,y double,flow_acc_val double",
+        x=2, y=3,
+        cat=1,
+        columns="basin_id int, x double, y double, flow_acc_val double",
         overwrite=True
     )
-
     os.unlink(tmp.name)
-    print(f"Pour Points: Vector '{output_vector}' created with {len(records)} points.")
-    return output_vector
+
+    print(f"Pour Points: {len(records)} outlets written to '{output_vector}'.")
+    return output_vector, pour_pts        
                             
 def compute_catchment_area(flow_acc_rast: str,
                            dem_rast: str,
@@ -269,86 +315,76 @@ def compute_catchment_area(flow_acc_rast: str,
  
 def compute_mws_connectivity(micro_watersheds_rast: str,
                              flow_dir_rast: str,
-                             micro_watersheds_vect: str,
-                             output_geojson: Path) -> None:
+                             pour_pts: dict,
+                             output_geojson: Path) -> tuple:
     import grass.script as gs
     from grass.script import array as garray
- 
-    print("MWS connectivity: Building micro-watershed connectivity graph …")
- 
-    basin_arr  = garray.array(micro_watersheds_rast, null=-9999)
-    flowdir_arr = garray.array(flow_dir_rast, null=0)
- 
-    region = gs.region()
-    nrows, ncols = int(region["rows"]), int(region["cols"])
-    n      = region["n"]
-    w      = region["w"]
-    nsres  = region["nsres"]
-    ewres  = region["ewres"]
- 
+
+    print("MWS connectivity: building micro-watershed connectivity graph …")
+
+    region  = gs.region()
+    nrows   = int(region["rows"])
+    ncols   = int(region["cols"])
+    n       = region["n"]
+    w       = region["w"]
+    nsres   = region["nsres"]
+    ewres   = region["ewres"]
+
     DIR_OFFSETS = {
-        1: ( 1,  1),
-        2: ( 1,  0),
-        3: ( 1, -1),
-        4: ( 0, -1),
-        5: (-1, -1),
-        6: (-1,  0),
-        7: (-1,  1),
-        8: ( 0,  1),
-    }
- 
-    acc_arr = garray.array("flow_acc", null=-1)
- 
+    1: (-1, +1),  # NE
+    2: (-1,  0),  # N
+    3: (-1, -1),  # NW
+    4: ( 0, -1),  # W
+    5: (+1, -1),  # SW
+    6: (+1,  0),  # S
+    7: (+1, +1),  # SE
+    8: ( 0, +1),  # E
+}
+
+    gs.run_command("r.mapcalc",
+                   expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
+                   overwrite=True)
+    basin_arr   = garray.array("micro_watersheds_int", null=-9999)
+    flowdir_arr = garray.array(flow_dir_rast,          null=0)
+
     basin_ids = np.unique(basin_arr)
     basin_ids = basin_ids[(basin_ids > 0) & (basin_ids != -9999)]
- 
-    pour_pts = {}
-    for bid in basin_ids:
-        mask = basin_arr == bid
-        if not mask.any():
-            continue
-        local_acc = np.where(mask, acc_arr, -np.inf)
-        idx = np.unravel_index(np.argmax(local_acc), local_acc.shape)
-        pour_pts[int(bid)] = idx  # (row, col)
- 
-    def rc_to_xy(row, col):
-        """Convert raster row/col to map coordinates (cell centre)."""
-        x = w + (col + 0.5) * ewres
-        y = n - (row + 0.5) * nsres
-        return x, y
- 
+
     basin_centroids = {}
     for bid in basin_ids:
-        mask = basin_arr == bid
-        rows_idx, cols_idx = np.where(mask)
+        bid = int(bid)
+        rows_idx, cols_idx = np.where(basin_arr == bid)
         cx = w + (cols_idx.mean() + 0.5) * ewres
         cy = n - (rows_idx.mean() + 0.5) * nsres
-        basin_centroids[int(bid)] = (cx, cy)
- 
+        basin_centroids[bid] = (cx, cy)
+
     edges = {}
 
     for bid, (pr, pc) in pour_pts.items():
         direction = int(flowdir_arr[pr, pc])
         if direction not in DIR_OFFSETS:
-            continue 
-        dr, dc = DIR_OFFSETS[direction]
-        nr_, nc_ = pr + dr, pc + dc
-        if not (0 <= nr_ < nrows and 0 <= nc_ < ncols):
-            continue  # flows outside raster extent
-        downstream_basin = int(basin_arr[nr_, nc_])
-        if downstream_basin <= 0 or downstream_basin == -9999:
             continue
+
+        dr, dc = DIR_OFFSETS[direction]
+        nr, nc = pr + dr, pc + dc
+
+        if not (0 <= nr < nrows and 0 <= nc < ncols):
+            continue 
+
+        downstream_basin = int(basin_arr[nr, nc])
+        if downstream_basin <= 0 or downstream_basin == -9999:
+            continue 
+
         if downstream_basin != bid:
-            edge_key = (bid, downstream_basin)
-            edges[edge_key] = True
- 
+            edges[(bid, downstream_basin)] = True
+
     features = []
     for (from_id, to_id) in edges:
         if from_id not in basin_centroids or to_id not in basin_centroids:
             continue
         x0, y0 = basin_centroids[from_id]
         x1, y1 = basin_centroids[to_id]
-        feat = {
+        features.append({
             "type": "Feature",
             "geometry": {
                 "type": "LineString",
@@ -358,20 +394,14 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
                 "from_basin_id": from_id,
                 "to_basin_id":   to_id
             }
-        }
-        features.append(feat)
- 
-    geojson = {
-        "type": "FeatureCollection",
-        "features": features
-    }
- 
+        })
+
+    geojson = {"type": "FeatureCollection", "features": features}
     with open(output_geojson, "w") as f:
         json.dump(geojson, f, indent=2)
 
-    print(f"MWS connectivity: {len(features)} directed edges written: {output_geojson}")
+    print(f"MWS connectivity: {len(features)} directed edges -> {output_geojson}")
     return edges, basin_centroids, basin_ids
-
 
 def compute_catchments_with_stream_order(
     streams_rast: str,
@@ -610,9 +640,10 @@ def main():
 
     
 
-    pour_points_vect = compute_pour_points(
+    pour_points_vect, pour_points = compute_pour_points(
         micro_watersheds_rast=micro_watersheds,
         flow_acc_rast=flow_accumulation,
+        flow_dir_rast=flow_dir_ws,
         output_vector="pour_points"
     )
  
@@ -637,7 +668,7 @@ def main():
     edges, basin_centroids, basin_ids = compute_mws_connectivity(
         micro_watersheds_rast=micro_watersheds,
         flow_dir_rast=flow_dir_ws,
-        micro_watersheds_vect="watersheds_vect",         
+        pour_pts=pour_points,     
         output_geojson=Path(args.output) / "mws_connectivity.geojson"
     )
     

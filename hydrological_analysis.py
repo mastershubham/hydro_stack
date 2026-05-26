@@ -36,7 +36,7 @@ import math
 
 
 MIN_WATERSHED_SIZE = 500 # 500 hectares
-HYPER_PARAM = 1000 # Initial threshold for r.watershed. 1000 cells. 
+HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -143,7 +143,7 @@ def natural_depressions(dem_filled, dem_original):
     gs.run_command("r.mapcalc", expr=f"{dep_map} = {dem_filled} - {dem_original}", overwrite=True)
     return dep_map
 
-def calculate_flow_accumulation(dem_filled, hyperparam_threshold, size_threshold):
+def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
     import grass.script as gs
     gs.run_command("r.watershed", 
                 elevation=dem_filled, 
@@ -154,24 +154,272 @@ def calculate_flow_accumulation(dem_filled, hyperparam_threshold, size_threshold
                 #stream="streams_raw",
                 flags="as",          # -a: positive accumulation; -s: single-flow (D8) 
                 overwrite=True)
-    
-    gs.run_command("r.reclass.area",
-                input="micro_watersheds",
-                output="micro_watersheds_filtered",
-                value=size_threshold, 
-                mode="lesser",
-                method="rmarea",
-                overwrite=True)
 
-    gs.run_command("g.remove",
-                type="raster",
-                name="micro_watersheds",
-                flags="f")
-
-    gs.run_command("g.rename",
-                raster=("micro_watersheds_filtered", "micro_watersheds"))
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
 
+def merge_small_watersheds(
+    micro_watersheds_rast: str,
+    flow_acc_rast: str,
+    flow_dir_rast: str,
+    min_area_ha: float,
+    epsg: int,
+    output_rast: str = "micro_watersheds",
+) -> str:
+    import grass.script as gs
+    from grass.script import array as garray
+
+    DIR_OFFSETS = {
+        1: (-1, +1),   # NE
+        2: (-1,  0),   # N
+        3: (-1, -1),   # NW
+        4: ( 0, -1),   # W
+        5: (+1, -1),   # SW
+        6: (+1,  0),   # S
+        7: (+1, +1),   # SE
+        8: ( 0, +1),   # E
+    }
+ 
+    region   = gs.region()
+    nrows    = int(region["rows"])
+    ncols    = int(region["cols"])
+    cell_m2  = abs(region["nsres"]) * abs(region["ewres"])
+    cell_ha  = cell_m2 / 10_000.0
+    min_cells = min_area_ha / cell_ha      # threshold in cells
+ 
+    print(
+        f"[merge_small_watersheds] cell = {cell_ha:.4f} ha  "
+        f": min_cells = {min_cells:.1f}"
+    )
+ 
+    gs.run_command(
+        "r.mapcalc",
+        expr=f"_mws_work = int({micro_watersheds_rast})",
+        overwrite=True,
+    )
+    basin_arr   = garray.array("_mws_work",   null=-9999).astype(np.int32)
+    acc_arr     = garray.array(flow_acc_rast, null=-1).astype(np.float32)
+    flowdir_arr = garray.array(flow_dir_rast, null=0).astype(np.int8)
+ 
+    def _build_maps(basin_arr, acc_arr, flowdir_arr):
+        """
+        Returns
+        -------
+        downstream : dict  basin_id → downstream_basin_id (or None for outlets)
+        area_cells : dict  basin_id → cell count
+        upstream   : dict  basin_id → list of upstream basin_ids
+        """
+        ids = np.unique(basin_arr)
+        ids = ids[(ids > 0) & (ids != -9999)]
+ 
+        area_cells = {int(bid): int(np.sum(basin_arr == bid)) for bid in ids}
+ 
+        # Find the pour point of each basin: the boundary cell with the highest
+        # accumulation whose downstream cell belongs to a different basin.
+        downstream = {}
+        for bid in ids:
+            bid = int(bid)
+            rows_in, cols_in = np.where(basin_arr == bid)
+ 
+            best_acc   = -np.inf
+            best_target = None
+ 
+            for r, c in zip(rows_in.tolist(), cols_in.tolist()):
+                d = int(flowdir_arr[r, c])
+                if d not in DIR_OFFSETS:
+                    continue
+                dr, dc = DIR_OFFSETS[d]
+                nr, nc = r + dr, c + dc
+ 
+                if not (0 <= nr < nrows and 0 <= nc < ncols):
+                    # Cell drains out of the mask → this is an outlet cell.
+                    val = float(acc_arr[r, c])
+                    if val > best_acc:
+                        best_acc    = val
+                        best_target = None   # sentinel: no downstream basin
+                    continue
+ 
+                nb = int(basin_arr[nr, nc])
+                if nb != bid and nb > 0 and nb != -9999:
+                    val = float(acc_arr[r, c])
+                    if val > best_acc:
+                        best_acc    = val
+                        best_target = nb
+ 
+            downstream[bid] = best_target   # None → outlet
+ 
+        upstream = {int(bid): [] for bid in ids}
+        for src, tgt in downstream.items():
+            if tgt is not None:
+                upstream.setdefault(int(tgt), []).append(int(src))
+ 
+        return downstream, area_cells, upstream
+ 
+    # ── Iterative merge ───────────────────────────────────────────────────────
+    iteration   = 0
+    total_merged = 0
+
+    unmergeable = set()
+    while True:
+        downstream, area_cells, upstream = _build_maps(basin_arr, acc_arr, flowdir_arr)
+ 
+        small_basins = sorted(
+            [(area, bid) for bid, area in area_cells.items() if area < min_cells
+            and bid not in unmergeable]
+        )   # ascending by area: smallest first
+ 
+        if not small_basins:
+            print(
+                f"[merge_small_watersheds] Done after {iteration} iteration(s), "
+                f"{total_merged} merges total.  "
+                f"All {len(area_cells)} basins ≥ {min_area_ha} ha."
+            )
+            break
+ 
+        merges_this_pass = 0
+ 
+        for _area, bid in small_basins:
+            # bid may have already been absorbed earlier in this same pass.
+            if bid not in area_cells:
+                continue
+            current_area = int(np.sum(basin_arr == bid))
+            if current_area >= min_cells:
+                continue
+ 
+            # ── Choose merge target ───────────────────────────────────────────
+            ds = downstream.get(bid)
+ 
+            if ds is not None and ds in area_cells:
+                target = ds          # preferred: downstream neighbour
+            else:
+                # Outlet basin or downstream has already been merged.
+                # Merge into the largest upstream neighbour (if any).
+                us_ids = [u for u in upstream.get(bid, []) if u in area_cells]
+                if not us_ids:
+                    # Isolated basin (shouldn't happen with a proper DEM, but
+                    # guard against degenerate inputs).
+                    unmergeable.add(bid)
+                    print(
+                        f"[merge_small_watersheds] NOTE: basin {bid} has no "
+                        f"valid neighbours – skipping."
+                    )
+                    continue
+                target = max(us_ids, key=lambda u: area_cells[u])
+ 
+            # ── Apply merge in the array ─────────────────────────────────────
+            # Relabel every cell of `bid` as `target`.
+            basin_arr[basin_arr == bid] = target
+            area_cells[target] = int(area_cells.get(target, 0) + area_cells.pop(bid, 0))
+ 
+            # Update connectivity maps so subsequent basins in *this pass* see
+            # the corrected topology.
+            # Any basin that pointed downstream to `bid` now points to `target`.
+            for other, other_ds in list(downstream.items()):
+                if other_ds == bid:
+                    downstream[other] = target
+            # Any upstream list that referenced `bid` should reference `target`.
+            for other_ups in upstream.values():
+                for i, u in enumerate(other_ups):
+                    if u == bid:
+                        other_ups[i] = target
+            # Move `bid`'s upstream children under `target`.
+            absorbed_us = upstream.pop(bid, [])
+            upstream.setdefault(target, []).extend(
+                [u for u in absorbed_us if u != target]
+            )
+            downstream.pop(bid, None)
+            upstream[target] = [u for u in upstream.get(target, []) if u != target]
+ 
+            merges_this_pass += 1
+            total_merged      += 1
+ 
+        iteration += 1
+ 
+        if merges_this_pass == 0:
+            # No progress was made (e.g. every remaining small basin is an
+            # isolated island or all are outlets with no upstream neighbour).
+            remaining_small = sum(
+                1 for bid, area in area_cells.items() if area < min_cells
+            )
+            if remaining_small:
+                print(
+                    f"[merge_small_watersheds] NOTE: {remaining_small} basin(s) "
+                    f"remain below {min_area_ha} ha but have no valid merge "
+                    f"candidate – kept as-is."
+                )
+            break
+ 
+    # ── Renumber to compact sequential IDs ───────────────────────────────────
+    # This matches what r.watershed produces and keeps downstream code happy.
+    final_ids = np.unique(basin_arr)
+    final_ids = final_ids[(final_ids > 0) & (final_ids != -9999)]
+    new_id     = 1
+    for old_id in sorted(final_ids.tolist()):
+        basin_arr[basin_arr == old_id] = -(new_id)   # temp negative to avoid collisions
+        new_id += 1
+    basin_arr = -basin_arr                             # flip sign: negatives → positives
+    # Cells that were -9999 (NODATA) became +9999 after negation → restore.
+    basin_arr[basin_arr == 9999] = -9999
+ 
+    # ── Write result back to GRASS ────────────────────────────────────────────
+    # garray.array is read-only view; we must use a new array object.
+    out_arr          = garray.array()
+    out_arr.null_value = -9999
+    # garray requires a writable float64 buffer:
+    out_data          = out_arr.__array__() if hasattr(out_arr, "__array__") else out_arr
+    # Simplest portable write: dump to ASCII and re-import.
+    import tempfile, os
+    tmp_asc = tempfile.NamedTemporaryFile(suffix=".r.mapcalc", delete=False)
+    tmp_asc.close()
+ 
+    # Build a r.mapcalc expression from the final array using r.in.gdal path:
+    # It is cleaner and faster to write a temporary GeoTIFF via rasterio and
+    # import it with r.in.gdal.
+    import rasterio
+    from rasterio.transform import from_bounds
+ 
+    region = gs.region()
+    transform = from_bounds(
+        region["w"], region["s"], region["e"], region["n"],
+        ncols, nrows,
+    )
+ 
+    tmp_tif = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+    tmp_tif.close()
+ 
+    write_arr = basin_arr.astype(np.int32)
+    write_arr[write_arr == -9999] = -2147483648   # GeoTIFF nodata for int32
+
+
+    crs = f"EPSG:{epsg}" if epsg else None
+    with rasterio.open(
+        tmp_tif.name, "w",
+        driver="GTiff",
+        height=nrows, width=ncols,
+        count=1, dtype="int32",
+        crs=crs,
+        transform=transform,
+        nodata=-2147483648,
+    ) as dst:
+        dst.write(write_arr, 1)
+ 
+    gs.run_command(
+        "r.in.gdal",
+        input=tmp_tif.name,
+        output=output_rast,
+        overwrite=True,
+    )
+    os.unlink(tmp_tif.name)
+    os.unlink(tmp_asc.name)
+ 
+    # Clean temp working raster
+    gs.run_command("g.remove", type="raster", name="_mws_work", flags="f")
+ 
+    final_count = len(np.unique(basin_arr[(basin_arr > 0) & (basin_arr != 9999)]))
+    print(
+        f"[merge_small_watersheds] '{output_rast}' written "
+        f"({final_count} basins finally)."
+    )
+    return output_rast
 
 def compute_pour_points(micro_watersheds_rast: str,
                         flow_acc_rast: str,
@@ -534,7 +782,7 @@ def main():
     watershed_gdf.boundary.plot(color="black", ax=ax, linewidth=1.5)
     plt.colorbar(ax.images[0], ax=ax, label='Elevation(m)')
     plt.savefig(Path(args.output) / "dem_with_watershed.png", dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close()
     
     name_of_proj = Path(args.output).resolve().name
     session = setup_grass_session(args.grassdb, epsg, name_of_proj)
@@ -579,7 +827,7 @@ def main():
 
     plt.title("DEM in GRASS GIS (UTM)")
     plt.axis('off')
-    plt.show()
+    plt.close()
 
     
     dem_filled, flow_dir = fill_sinks("dem_utm")
@@ -588,8 +836,13 @@ def main():
     
     
     flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation(dem_filled,
-                                                                                   hyperparam_threshold=HYPER_PARAM,
-                                                                                   size_threshold=args.min_watershed_size)
+                                                                                   hyperparam_threshold=HYPER_PARAM)
+
+    micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
+                                              flow_acc_rast=flow_accumulation,
+                                              flow_dir_rast=flow_dir_ws,
+                                              epsg=epsg,
+                                              min_area_ha=args.min_watershed_size)
 
     gs.run_command("r.stream.extract",
                elevation=dem_filled,

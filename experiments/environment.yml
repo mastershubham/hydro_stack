@@ -1,0 +1,12 @@
+name: watershed_env
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - notebook
+  - jupyter
+  - ipykernel
+  - geopandas
+  - rasterio
+  - grass

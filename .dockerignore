@@ -1,0 +1,4 @@
+# Ignore the experiments folder(the notebook and the environment files)
+/environment
+
+  

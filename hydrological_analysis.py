@@ -37,7 +37,7 @@ import math
 MIN_WATERSHED_SIZE = 500 # 500 hectares
 HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
 CONFIG = {
-        "DEM": "FABDEM", # FABDEM/ SRTM1
+        "DEM": "SRTM1", # FABDEM/ SRTM1
         }
 
 if (CONFIG["DEM"] == "SRTM1"):

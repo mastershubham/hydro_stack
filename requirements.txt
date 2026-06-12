@@ -2,3 +2,4 @@ geopandas
 elevation
 rasterio
 matplotlib
+fabdem

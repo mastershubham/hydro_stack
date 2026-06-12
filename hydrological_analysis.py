@@ -22,7 +22,6 @@ Description:
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
-import elevation
 from pathlib import Path
 import argparse
 import shutil
@@ -37,6 +36,23 @@ import math
 
 MIN_WATERSHED_SIZE = 500 # 500 hectares
 HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
+CONFIG = {
+        "DEM": "FABDEM", # FABDEM/ SRTM1
+        }
+
+if (CONFIG["DEM"] == "SRTM1"):
+    try:
+        import elevation
+    except ImportError:
+        raise ImportError("pip install elevation  - required for SRTM1 download")
+elif(CONFIG["DEM"] == "FABDEM"):
+    try:
+        import fabdem
+    except ImportError:
+        raise ImportError("pip install fabdem - required for FABDEM download")
+else:
+    print("Specify the DEM to use. Options: SRTM1/ FABDEM")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -152,7 +168,7 @@ def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
                 threshold=hyperparam_threshold, 
                 basin="micro_watersheds",
                 #stream="streams_raw",
-                flags="as",          # -a: positive accumulation; -s: single-flow (D8) 
+                flags="s",          # -a: positive accumulation; -s: single-flow (D8) 
                 overwrite=True)
 
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
@@ -767,10 +783,23 @@ def main():
     location_of_dem = Path(args.output) / "dem_raw.tif"
     location_of_dem = location_of_dem.resolve()
 
-    elevation.clip(bounds=bbox, output=str(location_of_dem), product='SRTM1')
+    if (CONFIG["DEM"] == "SRTM1"):
+        elevation.clip(
+            bounds=bbox,
+            output=str(location_of_dem),
+            product="SRTM1",
+        )
+        elevation.clean()
+    elif(CONFIG["DEM"] == "FABDEM"):
+        fabdem.download(
+            bounds=bbox,
+            output_path=str(location_of_dem),
+            show_progress=True,
+        )
+    else:
+        print("Specify the DEM to use. Options: SRTM1/ FABDEM")
     print()
     print(f'DEM raster downloaded and saved to: {location_of_dem}')
-    elevation.clean()
 
     fig, ax = plt.subplots(figsize=(10,8))
 
@@ -778,7 +807,8 @@ def main():
     from rasterio.plot import show
     rasterin = rasterio.open(location_of_dem)
 
-    show(rasterin, ax=ax, cmap='terrain', title='SRTM 30m DEM')
+    dem_label = "FABDEM (30m)" if CONFIG["DEM"] == "FABDEM" else "SRTM1 (30m)"
+    show(rasterin, ax=ax, cmap='terrain', title=f'{dem_label}')
     watershed_gdf.boundary.plot(color="black", ax=ax, linewidth=1.5)
     plt.colorbar(ax.images[0], ax=ax, label='Elevation(m)')
     plt.savefig(Path(args.output) / "dem_with_watershed.png", dpi=300, bbox_inches='tight')

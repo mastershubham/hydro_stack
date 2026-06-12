@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     grass \
     make \
     grass-dev \
+    gdal-bin \
+    libgdal-dev \
     build-essential \
     python3-pip \
     python3-dev \
@@ -16,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 
@@ -28,8 +31,9 @@ RUN grass -c EPSG:4326 /tmp/grass_install -e && \
     rm -rf /tmp/grass_install
 
 RUN python3 -m venv /opt/venv --system-site-packages
+RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 

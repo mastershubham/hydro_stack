@@ -32,27 +32,14 @@ import rasterio
 import json
 import numpy as np
 import math
-
+from dem_downloader import DEMDownloader
 
 MIN_WATERSHED_SIZE = 500 # 500 hectares
 HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
+
 CONFIG = {
-        "DEM": "SRTM1", # FABDEM/ SRTM1
-        }
-
-if (CONFIG["DEM"] == "SRTM1"):
-    try:
-        import elevation
-    except ImportError:
-        raise ImportError("pip install elevation  - required for SRTM1 download")
-elif(CONFIG["DEM"] == "FABDEM"):
-    try:
-        import fabdem
-    except ImportError:
-        raise ImportError("pip install fabdem - required for FABDEM download")
-else:
-    print("Specify the DEM to use. Options: SRTM1/ FABDEM")
-
+    "DEM": "srtm30"
+}
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -776,30 +763,25 @@ def main():
     
 
     minx, miny, maxx, maxy = watershed_gdf.dissolve().total_bounds
-    buffer = 0.01 # Nearly 1 km buffer at regions near equator(in degrees)
+    buffer = 0.1 # Nearly 10 km buffer at regions near equator(in degrees)
     bbox = (minx -buffer, miny -buffer, maxx +buffer, maxy +buffer)
     epsg = get_utm_epsg_for_bbox(bbox)
 
     location_of_dem = Path(args.output) / "dem_raw.tif"
     location_of_dem = location_of_dem.resolve()
 
-    if (CONFIG["DEM"] == "SRTM1"):
-        elevation.clip(
-            bounds=bbox,
-            output=str(location_of_dem),
-            product="SRTM1",
-        )
-        elevation.clean()
-    elif(CONFIG["DEM"] == "FABDEM"):
-        fabdem.download(
-            bounds=bbox,
-            output_path=str(location_of_dem),
-            show_progress=True,
-        )
-    else:
-        print("Specify the DEM to use. Options: SRTM1/ FABDEM")
-    print()
-    print(f'DEM raster downloaded and saved to: {location_of_dem}')
+    dem_downloader = DEMDownloader(
+        dem_key = CONFIG["DEM"],
+        south = bbox[1],
+        north = bbox[3],
+        west = bbox[0],
+        east = bbox[2],
+        output = location_of_dem,
+        tile_deg = 1.0,
+        max_workers = 6,
+        max_retries = 5,
+    )
+    dem_downloader.run()
 
     fig, ax = plt.subplots(figsize=(10,8))
 

@@ -1,5 +1,6 @@
 # Hydrological Analysis
 Generic pipeline that runs standard hydrology algorithms for a given area of interest
+![Workflow](./images/hydro_stack.svg)
 
 ## Setup for end user
 

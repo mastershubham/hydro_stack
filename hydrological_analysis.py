@@ -664,6 +664,8 @@ def compute_catchments_with_stream_order(
     import grass.script as gs
     import tempfile, os
 
+    gs.run_command("g.region", raster=flow_dir_rast)
+
     seg_basins_rast = "tmp_seg_basins"
     gs.run_command(
         "r.stream.basins",
@@ -856,10 +858,13 @@ def main():
                                               epsg=epsg,
                                               min_area_ha=args.min_watershed_size)
 
+    gs.run_command("g.region", raster=flow_dir_ws)
+
+    flow_dir_st = "flow_dir_st"
     gs.run_command("r.stream.extract",
                elevation=dem_filled,
                accumulation=flow_accumulation,
-               direction=flow_dir_ws,
+               direction=flow_dir_st,
                stream_raster="streams_rast",
                stream_vector="streams_vect",
                threshold=args.threshold, 
@@ -867,7 +872,7 @@ def main():
 
     gs.run_command("r.stream.order",
                stream_rast="streams_rast",
-               direction=flow_dir_ws,
+               direction=flow_dir_st,
                elevation=dem_filled,
                accumulation=flow_accumulation,
                strahler="strahler_order",
@@ -921,7 +926,7 @@ def main():
     catchment_order_rast = compute_catchments_with_stream_order(
     streams_rast="streams_rast",
     strahler_rast="strahler_order",
-    flow_dir_rast=flow_dir_ws,
+    flow_dir_rast=flow_dir_st,
     output_rast="catchment_stream_order")
 
     gs.run_command("r.to.vect",

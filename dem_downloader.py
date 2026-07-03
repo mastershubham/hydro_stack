@@ -258,21 +258,36 @@ class DEMDownloader:
                 response.raise_for_status()
 
                 # Validate: OpenTopography returns HTML error pages with 200 status
-                content_type = response.headers.get("Content-Type", "")
-                if "text/html" in content_type or "application/xml" in content_type:
-                    body = response.content.decode(errors="replace")[:300]
-                    raise ValueError(f"API returned non-raster content: {body}")
+                content_type = response.headers.get("Content-Type", "").lower()
+
+                if ("text/html" in content_type
+                    or "application/xml" in content_type
+                    or "text/xml" in content_type
+                    or "application/json" in content_type):
+                    body = response.content.decode(errors="replace")[:500]
+                    raise ValueError(
+                        f"API returned non-raster content "
+                        f"(Content-Type={content_type})\n{body}")                    
 
                 # Stream to disk to handle large tiles gracefully
                 tmp_path = filepath.with_suffix(".tmp")
                 with open(tmp_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=1024 * 256):
-                        f.write(chunk)
+                        if chunk:
+                            f.write(chunk)
 
                 # Validate the downloaded file is a readable raster
                 with rasterio.open(tmp_path) as ds:
-                    if ds.width == 0 or ds.height == 0:
-                        raise ValueError("Downloaded raster has zero dimensions.")
+                    try:
+                        with rasterio.open(tmp_path) as ds:
+                            if ds.width == 0 or ds.height == 0:
+                                raise ValueError("Downloaded raster has zero dimensions.")
+                    except Exception:
+                        body = tmp_path.read_bytes()[:500]
+                        raise RuntimeError(
+                            f"Downloaded file is not a valid raster.\n"
+                            f"Content-Type={content_type}\n"
+                            f"First bytes={body!r}")
 
                 tmp_path.rename(filepath)
                 log.info(f"✓ Downloaded tile ({s},{w})-({n},{e})  [{filepath.stat().st_size // 1024} KB]")
@@ -281,6 +296,7 @@ class DEMDownloader:
 
             except (requests.RequestException, ValueError, rasterio.errors.RasterioIOError) as err:
                 log.warning(f"Attempt {attempt} failed for tile ({s},{w})-({n},{e}): {err}")
+                print(f"Status Code: {response.status_code}\n")
                 # Remove partial/corrupt file before retry
                 for p in (filepath, filepath.with_suffix(".tmp")):
                     if p.exists():

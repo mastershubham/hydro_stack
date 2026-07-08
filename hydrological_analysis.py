@@ -132,6 +132,34 @@ def get_utm_epsg_for_bbox(bbox):
     else:
         raise ValueError("No suitable UTM CRS found for the given AOI.")
 
+def dem_preprocessing(input_dem, output_dir):
+    breached_dem = Path(output_dir) / "dem_breached.tif"
+    conditioned_dem = Path(output_dir) / "dem_conditioned.tif"
+
+    print("DEM Conditioning...")
+
+    subprocess.run(
+        [
+            "whitebox_tools",
+            "--run=BreachDepressionsLeastCost",
+            f"--dem={input_dem}",
+            f"--output={breached_dem}",
+        ],
+        check=True,
+    )
+
+    subprocess.run(
+        [
+            "whitebox_tools",
+            "--run=FillDepressions",
+            f"--dem={breached_dem}",
+            f"--output={conditioned_dem}",
+
+        ],
+        check=True,
+    )
+    return conditioned_dem
+
 def fill_sinks(dem_raster):
     print("Filling sinks in DEM...")
     import grass.script as gs

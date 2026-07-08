@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     python3-venv \
     git \
+    wget \
+    unzip \
     ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -34,6 +36,13 @@ RUN python3 -m venv /opt/venv --system-site-packages
 RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 ENV PATH="/opt/venv/bin:$PATH"
+
+RUN wget https://www.whiteboxgeo.com/WBT_Linux/WhiteboxTools_linux_amd64.zip && \
+    unzip WhiteboxTools_linux_amd64.zip -d /opt && \
+    chmod +x /opt/WhiteboxTools_linux_amd64/WBT/whitebox_tools && \
+    rm WhiteboxTools_linux_amd64.zip
+
+ENV PATH="/opt/WhiteboxTools_linux_amd64/WBT:$PATH"
 
 COPY . .
 

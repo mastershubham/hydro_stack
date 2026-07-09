@@ -1,4 +1,3 @@
-# GDAL 3.12.2 "Chicoutimi"
 FROM ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
 
 ENV DEBIAN_FRONTEND=noninteractive \

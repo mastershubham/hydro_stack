@@ -32,7 +32,9 @@ import rasterio
 import json
 import numpy as np
 import math
+import whitebox_workflows as wbw
 from dem_downloader import DEMDownloader
+import time
 
 MIN_WATERSHED_SIZE = 500 # 500 hectares
 HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
@@ -133,32 +135,30 @@ def get_utm_epsg_for_bbox(bbox):
         raise ValueError("No suitable UTM CRS found for the given AOI.")
 
 def dem_preprocessing(input_dem, output_dir):
-    breached_dem = Path(output_dir) / "dem_breached.tif"
-    conditioned_dem = Path(output_dir) / "dem_conditioned.tif"
+    breached_dem = str(Path(output_dir) / "dem_breached.tif")
+    conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
 
     print("DEM Conditioning...")
 
-    subprocess.run(
-        [
-            "whitebox_tools",
-            "--run=BreachDepressionsLeastCost",
-            f"--dem={input_dem}",
-            f"--output={breached_dem}",
-        ],
-        check=True,
-    )
+    wbe = wbw.WbEnvironment()
 
-    subprocess.run(
-        [
-            "whitebox_tools",
-            "--run=FillDepressions",
-            f"--dem={breached_dem}",
-            f"--output={conditioned_dem}",
-
-        ],
-        check=True,
+    dem_in = wbe.read_raster(input_dem)
+    breached = wbe.hydrology.depressions_storage.breach_depressions_least_cost(
+        dem=dem_in,
+        max_dist=100, 
+        fill_deps=False
     )
-    return conditioned_dem
+    wbe.write_raster(breached, breached_dem)
+
+    conditioned = wbe.hydrology.depressions_storage.fill_depressions(
+        dem=breached,
+        flat_increment=0.001
+    )
+    wbe.write_raster(conditioned, conditioned_dem)
+
+    print(f"DEM conditioning complete: {conditioned_dem}")
+
+    return conditioned
 
 def fill_sinks(dem_raster):
     print("Filling sinks in DEM...")
@@ -168,11 +168,12 @@ def fill_sinks(dem_raster):
     gs.run_command("r.fill.dir", input=dem_raster, output=filled_dem, direction=flow_dir, overwrite=True)
     return filled_dem, flow_dir
 
-def natural_depressions(dem_filled, dem_original):
-    import grass.script as gs
-    dep_map = "natural_depressions"
-    gs.run_command("r.mapcalc", expr=f"{dep_map} = {dem_filled} - {dem_original}", overwrite=True)
-    return dep_map
+def natural_depressions(input_dem, output_dir):
+    wbe = wbw.WbEnvironment()
+    dem_in = wbe.read_raster(input_dem)
+    depth_raster = wbe.hydrology.depth_in_sink(dem=dem_in)
+    wbe.write_raster(depth_raster, str(Path(output_dir) / "natural_depressions.tif"))
+    return None
 
 def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
     import grass.script as gs
@@ -183,7 +184,7 @@ def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
                 threshold=hyperparam_threshold, 
                 basin="micro_watersheds",
                 #stream="streams_raw",
-                flags="s",          # -a: positive accumulation; -s: single-flow (D8) 
+                flags="as",          # -a: positive accumulation; -s: single-flow (D8) 
                 overwrite=True)
 
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
@@ -903,12 +904,22 @@ def main():
     str(Path(args.output) / f"dem_{epsg}.tif")
     ])
 
+    input_dem = str(Path(args.output) / f"dem_{epsg}.tif")
+    output_dir = Path(args.output).resolve()
+    dem_conditioned = dem_preprocessing(input_dem, output_dir)
+
     gs.run_command("r.in.gdal",
-               input=str(Path(args.output) / f"dem_{epsg}.tif"),
+               input=input_dem,
                output="dem_utm",
                overwrite=True)
+    
+    gs.run_command("r.in.gdal",
+               input=str(Path(args.output) / "dem_conditioned.tif"),
+               output="dem_conditioned",
+               overwrite=True)
+    
 
-    gs.run_command("g.region", raster="dem_utm", flags="p")
+    gs.run_command("g.region", raster="dem_conditioned", flags="p")
 
     watershed_utm_path = Path(args.output) / "watershed_utm.shp"
     watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
@@ -937,17 +948,17 @@ def main():
     plt.close()
 
     
-    dem_filled, _ = fill_sinks("dem_utm")
+    # dem_filled, _ = fill_sinks("dem_utm")
     
-    depressions = natural_depressions(dem_filled, "dem_utm")
+    natural_depressions(input_dem, args.output)
     
     
-    flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation(dem_filled,
+    flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
                                                                                    hyperparam_threshold=HYPER_PARAM)
 
     flow_dir_st = "flow_dir_st"
     gs.run_command("r.stream.extract",
-               elevation=dem_filled,
+               elevation="dem_conditioned",
                accumulation=flow_accumulation,
                direction=flow_dir_st,
                stream_raster="streams_rast",
@@ -958,7 +969,7 @@ def main():
     gs.run_command("r.stream.order",
                stream_rast="streams_rast",
                direction=flow_dir_st,
-               elevation=dem_filled,
+               elevation="dem_conditioned",
                accumulation=flow_accumulation,
                strahler="strahler_order",
                shreve="shreve_order",
@@ -971,12 +982,12 @@ def main():
     flow_dir_rast=flow_dir_st,
     output_rast="catchment_stream_order")
 
+    '''
     micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
                                               flow_acc_rast=flow_accumulation,
                                               flow_dir_rast=flow_dir_ws,
                                               epsg=epsg,
                                               min_area_ha=args.min_watershed_size)
-    '''
 
     # Join stream_type and type_code from streams_vect into streams_with_order
     # Both vectors share 'cat' as the common key
@@ -1018,7 +1029,7 @@ def main():
  
     catchment_area_rast = compute_catchment_area(
         flow_acc_rast=flow_accumulation,
-        dem_rast=dem_filled,
+        dem_rast="dem_conditioned",
         output_rast="catchment_area_m2"
     )
 
@@ -1072,10 +1083,9 @@ def main():
 
     gs.run_command("r.mask", flags="r")
     rasters_to_export = {
-            "dem_filled":           dem_filled,
             "flow_direction":       flow_dir_ws,
             "flow_accumulation":    flow_accumulation,
-            "natural_depressions":  depressions,
+            #"natural_depressions":  depressions,
             "stream_order":         "strahler_order",
             "catchment_area_m2":    catchment_area_rast,
             #"catchment_stream_order":  catchment_order_rast, 
@@ -1093,4 +1103,9 @@ def main():
         session.close()
 
 if __name__ == "__main__":
+    start_time = time.perf_counter()
     main()
+
+    end_time = time.perf_counter()
+    elapsed_time = end_time - start_time
+    print(f"Total execution time: {elapsed_time // 3600} hrs {(elapsed_time % 3600) // 60} mins {(elapsed_time % 60):.2f} secs")

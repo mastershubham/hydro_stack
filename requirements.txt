@@ -1,4 +1,5 @@
 geopandas
 rasterio
 matplotlib
+whitebox-workflows
 fabdem

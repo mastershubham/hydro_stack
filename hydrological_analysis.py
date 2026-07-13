@@ -35,6 +35,7 @@ import math
 import whitebox_workflows as wbw
 from dem_downloader import DEMDownloader
 import time
+import richdem as rd
 
 MIN_WATERSHED_SIZE = 500 # 500 hectares
 HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
@@ -135,7 +136,19 @@ def get_utm_epsg_for_bbox(bbox):
         raise ValueError("No suitable UTM CRS found for the given AOI.")
 
 def dem_preprocessing(input_dem, output_dir):
-    breached_dem = str(Path(output_dir) / "dem_breached.tif")
+    conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
+
+    dem_in = rd.LoadGDAL(input_dem, no_data=-9999.0)
+    print(dem_in)
+
+    filled_dem = rd.FillDepressions(dem_in, in_place=False)
+
+    rd.SaveGDAL(conditioned_dem, filled_dem)
+
+    return filled_dem
+    
+'''
+def dem_preprocessing(input_dem, output_dir):
     conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
 
     print("DEM Conditioning...")
@@ -143,15 +156,11 @@ def dem_preprocessing(input_dem, output_dir):
     wbe = wbw.WbEnvironment()
 
     dem_in = wbe.read_raster(input_dem)
-    breached = wbe.hydrology.depressions_storage.breach_depressions_least_cost(
-        dem=dem_in,
-        max_dist=100, 
-        fill_deps=False
-    )
-    wbe.write_raster(breached, breached_dem)
-
-    conditioned = wbe.hydrology.depressions_storage.fill_depressions(
-        dem=breached,
+    dem_pitless = wbe.hydrology.depressions_storage.fill_pits(dem=dem_in)
+    conditioned = wbe.hydrology.depressions_storage.breach_depressions_least_cost(
+        dem=dem_pitless,
+        max_dist=20, 
+        fill_deps=True,
         flat_increment=0.001
     )
     wbe.write_raster(conditioned, conditioned_dem)
@@ -167,6 +176,7 @@ def fill_sinks(dem_raster):
     flow_dir = "flow_dir"
     gs.run_command("r.fill.dir", input=dem_raster, output=filled_dem, direction=flow_dir, overwrite=True)
     return filled_dem, flow_dir
+'''
 
 def natural_depressions(input_dem, output_dir):
     wbe = wbw.WbEnvironment()

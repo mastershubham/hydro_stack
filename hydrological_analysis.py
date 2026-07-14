@@ -768,16 +768,30 @@ def compute_catchments_with_stream_order(
     import grass.script as gs
     import tempfile, os
 
-    gs.run_command("g.region", raster=flow_dir_rast)
+    gs.run_command("g.region", raster=flow_dir_rast, flags="a")
 
-    seg_basins_rast = "tmp_seg_basins"
-    gs.run_command(
-        "r.stream.basins",
-        direction=flow_dir_rast,
-        stream_rast=streams_rast,
-        basins=seg_basins_rast,
-        overwrite=True
-    )
+    mask_present = bool(gs.find_file("MASK", element="cell")["file"])
+    mask_backup = "tmp_mask_backup"
+    if mask_present:
+        gs.run_command("g.copy", raster="MASK," + mask_backup, overwrite=True)
+        gs.run_command("r.mask", flags="r")
+        print("[compute_catchments_with_stream_order] MASK temporarily removed.")
+
+    try:
+        seg_basins_rast = "tmp_seg_basins"
+        gs.run_command(
+            "r.stream.basins",
+            direction=flow_dir_rast,
+            stream_rast=streams_rast,
+            basins=seg_basins_rast,
+            overwrite=True
+        )
+
+    finally:
+        if mask_present:
+            gs.run_command("r.mask", raster=mask_backup, overwrite=True)
+            gs.run_command("g.remove", type="raster", name=mask_backup, flags="f")
+            print("[compute_catchments_with_stream_order] MASK restored.")
 
     raw = gs.read_command(
         "r.stats",
@@ -985,14 +999,14 @@ def main():
                shreve="shreve_order",
                stream_vect="streams_with_order",
                overwrite=True)
-    '''
+  
     catchment_order_rast = compute_catchments_with_stream_order(
     streams_rast="streams_rast",
     strahler_rast="strahler_order",
     flow_dir_rast=flow_dir_st,
     output_rast="catchment_stream_order")
 
-    '''
+  
     micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
                                               flow_acc_rast=flow_accumulation,
                                               flow_dir_rast=flow_dir_ws,
@@ -1098,7 +1112,7 @@ def main():
             #"natural_depressions":  depressions,
             "stream_order":         "strahler_order",
             "catchment_area_m2":    catchment_area_rast,
-            #"catchment_stream_order":  catchment_order_rast, 
+            "catchment_stream_order":  catchment_order_rast, 
             "flow_direction_stream": flow_dir_st,
             "streams_raster": "streams_rast" 
         }

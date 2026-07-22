@@ -25,8 +25,20 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN grass -c EPSG:4326 /tmp/grass_install -e && \
-    grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.order && \
-    grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.basins && \
+    grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.order
+
+RUN git clone --depth=1 --filter=blob:none --no-checkout \
+        --branch patch-1 \
+        https://github.com/mastershubham/grass-addons.git /tmp/grass-addons && \
+    cd /tmp/grass-addons && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set src/raster/r.stream.basins && \
+    git checkout patch-1 && \
+    grass /tmp/grass_install/PERMANENT --exec \
+        g.extension \
+            extension=r.stream.basins \
+            url=/tmp/grass-addons/src/raster/r.stream.basins && \
+    rm -rf /tmp/grass-addons && \
     rm -rf /tmp/grass_install
 
 RUN python3 -m venv /opt/venv --system-site-packages

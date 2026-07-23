@@ -28,12 +28,12 @@ RUN grass -c EPSG:4326 /tmp/grass_install -e && \
     grass /tmp/grass_install/PERMANENT --exec g.extension extension=r.stream.order
 
 RUN git clone --depth=1 --filter=blob:none --no-checkout \
-        --branch patch-1 \
+        --branch grass8 \
         https://github.com/mastershubham/grass-addons.git /tmp/grass-addons && \
     cd /tmp/grass-addons && \
     git sparse-checkout init --cone && \
     git sparse-checkout set src/raster/r.stream.basins && \
-    git checkout patch-1 && \
+    git checkout grass8 && \
     grass /tmp/grass_install/PERMANENT --exec \
         g.extension \
             extension=r.stream.basins \

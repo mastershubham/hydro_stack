@@ -17,6 +17,10 @@ cd hydro_stack
 4. Run the pipeline after mounting the data and the necessary files/folders into the container.
 ```
 docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
+```
+Inside the container, first upload your OpenTopography API Key into the container and then run the pipeline. 
+```
+echo "OPEN_TOPOGRAPHY_KEY" > ~/.opentopography.txt
 python hydrological_analysis.py --shp ./data/masalia_tehsil_boundary.shp --output masalia --grassdb ~/grassdata
 ```
 
@@ -42,6 +46,10 @@ Put up the data somewhere preferably under hydro_stack or some folder under it.
 Now run the command as:
 ```
 docker run -it -w $(pwd) -v $(pwd):$(pwd) <name_of_the_image> bash
+```
+Inside the container, first upload your OpenTopography API Key into the container and then run the pipeline.
+```
+echo "OPEN_TOPOGRAPHY_KEY" > ~/.opentopography.txt
 python hydrological_analysis.py --shp ./data/masalia_tehsil_boundary.shp --output masalia --grassdb ~/grassdata
 ```
 

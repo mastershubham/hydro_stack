@@ -142,7 +142,7 @@ def dem_preprocessing(input_dem, output_dir):
     print(dem_in)
 
     filled_dem = rd.FillDepressions(dem_in, in_place=False)
-
+    rd.ResolveFlats(filled_dem, in_place=True)
     rd.SaveGDAL(conditioned_dem, filled_dem)
 
     return filled_dem
@@ -770,28 +770,14 @@ def compute_catchments_with_stream_order(
 
     gs.run_command("g.region", raster=flow_dir_rast, flags="a")
 
-    mask_present = bool(gs.find_file("MASK", element="cell")["file"])
-    mask_backup = "tmp_mask_backup"
-    if mask_present:
-        gs.run_command("g.copy", raster="MASK," + mask_backup, overwrite=True)
-        gs.run_command("r.mask", flags="r")
-        print("[compute_catchments_with_stream_order] MASK temporarily removed.")
-
-    try:
-        seg_basins_rast = "tmp_seg_basins"
-        gs.run_command(
-            "r.stream.basins",
-            direction=flow_dir_rast,
-            stream_rast=streams_rast,
-            basins=seg_basins_rast,
-            overwrite=True
-        )
-
-    finally:
-        if mask_present:
-            gs.run_command("r.mask", raster=mask_backup, overwrite=True)
-            gs.run_command("g.remove", type="raster", name=mask_backup, flags="f")
-            print("[compute_catchments_with_stream_order] MASK restored.")
+    seg_basins_rast = "tmp_seg_basins"
+    gs.run_command(
+        "r.stream.basins",
+        direction=flow_dir_rast,
+        stream_rast=streams_rast,
+        basins=seg_basins_rast,
+        overwrite=True
+    )
 
     raw = gs.read_command(
         "r.stats",
@@ -909,7 +895,7 @@ def main():
     from rasterio.plot import show
     rasterin = rasterio.open(location_of_dem)
 
-    dem_label = "FABDEM (30m)" if CONFIG["DEM"] == "FABDEM" else "SRTM1 (30m)"
+    dem_label = CONFIG["DEM"].upper()
     show(rasterin, ax=ax, cmap='terrain', title=f'{dem_label}')
     watershed_gdf.boundary.plot(color="black", ax=ax, linewidth=1.5)
     plt.colorbar(ax.images[0], ax=ax, label='Elevation(m)')
@@ -981,6 +967,7 @@ def main():
                                                                                    hyperparam_threshold=HYPER_PARAM)
 
     flow_dir_st = "flow_dir_st"
+    gs.run_command("r.mask", flags="r")
     gs.run_command("r.stream.extract",
                elevation="dem_conditioned",
                accumulation=flow_accumulation,
@@ -1005,7 +992,8 @@ def main():
     strahler_rast="strahler_order",
     flow_dir_rast=flow_dir_st,
     output_rast="catchment_stream_order")
-
+    
+    gs.run_command("r.mask", vector="watershed")
   
     micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
                                               flow_acc_rast=flow_accumulation,

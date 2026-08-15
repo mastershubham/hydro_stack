@@ -3,6 +3,7 @@ import tempfile
 import rasterio
 import numpy as np
 from pathlib import Path
+from unittest.mock import patch
 from dem_downloader import _tile_bbox, _load_api_key, DEMDownloader
 
 def test_tile_bbox_simple():

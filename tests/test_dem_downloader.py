@@ -16,6 +16,7 @@ def test_load_api_key_from_env(monkeypatch):
     assert _load_api_key(None) == "MY_KEY_123"
 
 def test_cache_hit_returns_path(tmp_path):
+    monkeypatch.setenv("OPENTOPOGRAPHY_API_KEY", "MY_KEY_123")
     # Prepare cache file
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
@@ -43,6 +44,7 @@ def test_cache_hit_returns_path(tmp_path):
     assert Path(path).samefile(fname)
 
 def test_merge_two_small_rasters(tmp_path):
+    monkeypatch.setenv("OPENTOPOGRAPHY_API_KEY", "MY_KEY_123")
     # create two tiny rasters and call _merge
     def make_raster(path, value, transform, crs="EPSG:4326"):
         data = np.full((1, 2, 2), value, dtype=np.float32)

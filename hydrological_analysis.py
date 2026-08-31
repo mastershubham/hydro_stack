@@ -948,19 +948,7 @@ def main():
     gs.run_command("r.mask",
                vector="watershed")
 
-    gs.run_command(
-        "r.mapcalc",
-        expression=(
-            "natural_depressions = if(isnull(dem_utm), null(), "
-            "if(dem_conditioned - dem_utm > 0, dem_conditioned - dem_utm, 0))"
-        ),
-        overwrite=True,
-    )
 
-    try:
-        gs.run_command("r.mask", flags="r")
-    except:
-        pass
     
     print("DEM imported into GRASS and region set to DEM extent.")
 

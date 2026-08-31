@@ -136,81 +136,35 @@ def get_utm_epsg_for_bbox(bbox):
 
 def dem_preprocessing(input_dem, output_dir):
     conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
+    depression_tif = str(Path(output_dir) / "natural_depressions.tif")
 
-    dem_in = rd.LoadGDAL(input_dem, no_data=-9999.0)
+    with rasterio.open(input_dem) as src:
+        nodata = src.nodata
+
+    if nodata is None:
+        nodata = -9999.0
+
+    dem_in = rd.LoadGDAL(input_dem, no_data=float(nodata))
     print(dem_in)
 
     filled_dem = rd.FillDepressions(dem_in, in_place=False)
+
+    dem_arr = np.asarray(dem_in)
+    filled_arr = np.asarray(filled_dem)
+    depth = filled_arr - dem_arr
+    nodata_mask = dem_arr == dem_in.no_data
+    depth[nodata_mask] = dem_in.no_data
+    depth[~nodata_mask] = np.clip(depth[~nodata_mask], 0, None)
+
+    depth_rd = rd.rdarray(depth, no_data=dem_in.no_data)
+    depth_rd.geotransform = dem_in.geotransform
+    depth_rd.projection = dem_in.projection
+    rd.SaveGDAL(depression_tif, depth_rd)
+
     rd.ResolveFlats(filled_dem, in_place=True)
     rd.SaveGDAL(conditioned_dem, filled_dem)
 
     return filled_dem
-    
-'''
-def dem_preprocessing(input_dem, output_dir):
-    conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
-
-    print("DEM Conditioning...")
-
-    wbe = wbw.WbEnvironment()
-
-    dem_in = wbe.read_raster(input_dem)
-    dem_pitless = wbe.hydrology.depressions_storage.fill_pits(dem=dem_in)
-    conditioned = wbe.hydrology.depressions_storage.breach_depressions_least_cost(
-        dem=dem_pitless,
-        max_dist=20, 
-        fill_deps=True,
-        flat_increment=0.001
-    )
-    wbe.write_raster(conditioned, conditioned_dem)
-
-    print(f"DEM conditioning complete: {conditioned_dem}")
-
-    return conditioned
-
-def fill_sinks(dem_raster):
-    print("Filling sinks in DEM...")
-    import grass.script as gs
-    filled_dem = "dem_filled"
-    flow_dir = "flow_dir"
-    gs.run_command("r.fill.dir", input=dem_raster, output=filled_dem, direction=flow_dir, overwrite=True)
-    return filled_dem, flow_dir
-'''
-
-def natural_depressions(original_dem, filled_dem, output_dir):
-    import grass.script as gs
-
-    original_path = str(original_dem)
-    filled_path = str(filled_dem)
-
-    dem_source = "dem_natural_depressions_in"
-    dem_filled = "dem_filled_for_depressions"
-    depression_depth = "natural_depressions"
-    output_tif = str(Path(output_dir) / "natural_depressions.tif")
-
-    if os.path.exists(original_path):
-        gs.run_command("r.in.gdal", input=original_path, output=dem_source, overwrite=True)
-    else:
-        dem_source = original_dem
-
-    if os.path.exists(filled_path):
-        gs.run_command("r.in.gdal", input=filled_path, output=dem_filled, overwrite=True)
-    else:
-        dem_filled = filled_dem
-
-    expression = (
-        f"{depression_depth} = if(isnull({dem_source}), null(), {dem_filled} - {dem_source})"
-    )
-    gs.run_command("r.mapcalc", expression=expression, overwrite=True)
-    gs.run_command(
-        "r.out.gdal",
-        input=depression_depth,
-        output=output_tif,
-        format="GTiff",
-        overwrite=True,
-    )
-
-    return depression_depth
 
 def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
     import grass.script as gs
@@ -574,15 +528,21 @@ def compute_pour_points(micro_watersheds_rast: str,
     nsres   = region["nsres"]
 
     DIR_OFFSETS = {
-    1: (-1, +1),  # NE
-    2: (-1,  0),  # N
-    3: (-1, -1),  # NW
-    4: ( 0, -1),  # W
-    5: (+1, -1),  # SW
-    6: (+1,  0),  # S
-    7: (+1, +1),  # SE
-    8: ( 0, +1),  # E
-}
+        1: (-1, +1),  # NE
+        2: (-1,  0),  # N
+        3: (-1, -1),  # NW
+        4: ( 0, -1),  # W
+        5: (+1, -1),  # SW
+        6: (+1,  0),  # S
+        7: (+1, +1),  # SE
+        8: ( 0, +1),  # E
+    }
+
+    dr_lookup = np.zeros(9, dtype=np.int32)
+    dc_lookup = np.zeros(9, dtype=np.int32)
+    for d, (dr, dc) in DIR_OFFSETS.items():
+        dr_lookup[d] = dr
+        dc_lookup[d] = dc
 
     gs.run_command("r.mapcalc",
                    expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
@@ -591,55 +551,52 @@ def compute_pour_points(micro_watersheds_rast: str,
     acc_arr = garray.array(flow_acc_rast, null=-1)
     flowdir_arr = garray.array(flow_dir_rast, null=0)
 
-    basin_ids = np.unique(basin_arr)
-    basin_ids = basin_ids[(basin_ids > 0) & (basin_ids != -9999)]
+    valid_mask = (basin_arr > 0) & (basin_arr != -9999)
+    rows, cols = np.where(valid_mask)
+    basins = basin_arr[rows, cols].astype(np.int32)
+    acc_vals = acc_arr[rows, cols].astype(np.float64)
+    dirs = flowdir_arr[rows, cols].astype(np.int32)
 
-    pour_pts = {}  
-    records  = []  
+    valid_dir = (dirs >= 1) & (dirs <= 8)
+    nr = np.full(rows.shape, -1, dtype=np.int32)
+    nc = np.full(cols.shape, -1, dtype=np.int32)
+    neighbor_basin = np.full(basins.shape, -1, dtype=np.int32)
 
-    for bid in basin_ids:
+    if valid_dir.any():
+        nr[valid_dir] = rows[valid_dir] + dr_lookup[dirs[valid_dir]]
+        nc[valid_dir] = cols[valid_dir] + dc_lookup[dirs[valid_dir]]
+        in_bounds = (nr >= 0) & (nr < nrows) & (nc >= 0) & (nc < ncols)
+        inside = valid_dir & in_bounds
+        if inside.any():
+            neighbor_basin[inside] = basin_arr[nr[inside], nc[inside]].astype(np.int32)
+    else:
+        in_bounds = np.zeros_like(valid_dir, dtype=bool)
+
+    candidate = (~valid_dir) | (~in_bounds) | ((valid_dir & in_bounds) & (neighbor_basin != basins))
+    candidate_idx = np.where(candidate)[0]
+
+    pour_pts = {}
+    records = []
+    basin_ids = np.unique(basins)
+
+    for bid in basin_ids.tolist():
         bid = int(bid)
+        if candidate_idx.size:
+            local = candidate_idx[basins[candidate_idx] == bid]
+        else:
+            local = np.array([], dtype=np.int64)
 
-        rows_in, cols_in = np.where(basin_arr == bid)
+        if local.size == 0:
+            local = np.where(basins == bid)[0]
 
-        best_acc = -np.inf
-        best_rc  = None
+        best_pos = int(local[np.argmax(acc_vals[local])])
+        r = int(rows[best_pos])
+        c = int(cols[best_pos])
+        best_acc = float(acc_vals[best_pos])
 
-        for r, c in zip(rows_in, cols_in):
-            direction = int(flowdir_arr[r, c])
-            if direction not in DIR_OFFSETS:
-                if float(acc_arr[r, c]) > best_acc:
-                    best_acc = float(acc_arr[r, c])
-                    best_rc  = (r, c)
-                continue
-
-            dr, dc = DIR_OFFSETS[direction]
-            nr, nc = r + dr, c + dc
-
-            outside = not (0 <= nr < nrows and 0 <= nc < ncols)
-            if outside:
-                if float(acc_arr[r, c]) > best_acc:
-                    best_acc = float(acc_arr[r, c])
-                    best_rc  = (r, c)
-                continue
-
-            downstream_basin = int(basin_arr[nr, nc])
-
-            if downstream_basin != bid and downstream_basin > 0 and downstream_basin != -9999:
-                if float(acc_arr[r, c]) > best_acc:
-                    best_acc = float(acc_arr[r, c])
-                    best_rc  = (r, c)
-
-        # Fallback 
-        if best_rc is None:
-            flat_idx = int(np.argmax(np.where(basin_arr == bid, acc_arr, -np.inf)))
-            best_rc  = (int(flat_idx // ncols), int(flat_idx  % ncols))
-            best_acc = float(acc_arr[best_rc])
-
-        pour_pts[bid] = best_rc
-        row, col = best_rc
-        x = w + (col + 0.5) * ewres
-        y = n - (row + 0.5) * nsres
+        pour_pts[bid] = (r, c)
+        x = w + (c + 0.5) * ewres
+        y = n - (r + 0.5) * nsres
         records.append((bid, x, y, best_acc))
 
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
@@ -664,7 +621,7 @@ def compute_pour_points(micro_watersheds_rast: str,
     os.unlink(tmp.name)
 
     print(f"Pour Points: {len(records)} outlets written to '{output_vector}'.")
-    return output_vector, pour_pts        
+    return output_vector, pour_pts
                             
 def compute_catchment_area(flow_acc_rast: str,
                            dem_rast: str,
@@ -713,35 +670,42 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
     ewres   = region["ewres"]
 
     DIR_OFFSETS = {
-    1: (-1, +1),  # NE
-    2: (-1,  0),  # N
-    3: (-1, -1),  # NW
-    4: ( 0, -1),  # W
-    5: (+1, -1),  # SW
-    6: (+1,  0),  # S
-    7: (+1, +1),  # SE
-    8: ( 0, +1),  # E
-}
+        1: (-1, +1),  # NE
+        2: (-1,  0),  # N
+        3: (-1, -1),  # NW
+        4: ( 0, -1),  # W
+        5: (+1, -1),  # SW
+        6: (+1,  0),  # S
+        7: (+1, +1),  # SE
+        8: ( 0, +1),  # E
+    }
 
     gs.run_command("r.mapcalc",
                    expr=f"micro_watersheds_int = int({micro_watersheds_rast})",
                    overwrite=True)
     basin_arr   = garray.array("micro_watersheds_int", null=-9999)
-    flowdir_arr = garray.array(flow_dir_rast,          null=0)
+    flowdir_arr = garray.array(flow_dir_rast, null=0)
 
-    basin_ids = np.unique(basin_arr)
-    basin_ids = basin_ids[(basin_ids > 0) & (basin_ids != -9999)]
+    valid_mask = (basin_arr > 0) & (basin_arr != -9999)
+    rows, cols = np.where(valid_mask)
+    basins = basin_arr[rows, cols].astype(np.int32)
+
+    basin_ids = np.unique(basins)
+    counts = np.bincount(basins, minlength=int(basin_ids.max()) + 1)
+    row_sums = np.bincount(basins, weights=rows.astype(np.float64), minlength=int(basin_ids.max()) + 1)
+    col_sums = np.bincount(basins, weights=cols.astype(np.float64), minlength=int(basin_ids.max()) + 1)
 
     basin_centroids = {}
-    for bid in basin_ids:
+    for bid in basin_ids.tolist():
         bid = int(bid)
-        rows_idx, cols_idx = np.where(basin_arr == bid)
-        cx = w + (cols_idx.mean() + 0.5) * ewres
-        cy = n - (rows_idx.mean() + 0.5) * nsres
+        count = int(counts[bid])
+        if count == 0:
+            continue
+        cx = w + (col_sums[bid] / count + 0.5) * ewres
+        cy = n - (row_sums[bid] / count + 0.5) * nsres
         basin_centroids[bid] = (cx, cy)
 
     edges = {}
-
     for bid, (pr, pc) in pour_pts.items():
         direction = int(flowdir_arr[pr, pc])
         if direction not in DIR_OFFSETS:
@@ -751,11 +715,11 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
         nr, nc = pr + dr, pc + dc
 
         if not (0 <= nr < nrows and 0 <= nc < ncols):
-            continue 
+            continue
 
         downstream_basin = int(basin_arr[nr, nc])
         if downstream_basin <= 0 or downstream_basin == -9999:
-            continue 
+            continue
 
         if downstream_basin != bid:
             edges[(bid, downstream_basin)] = True
@@ -904,7 +868,7 @@ def main():
     watershed_gdf.plot(color='white', edgecolor='gray', figsize=(15,12))
     plt.title("Input Watershed Boundary")
     plt.savefig(Path(args.output) / "watershed_boundary.png", dpi=300, bbox_inches='tight')
-    plt.show()
+    # plt.show()
     
 
     minx, miny, maxx, maxy = watershed_gdf.dissolve().total_bounds
@@ -983,6 +947,20 @@ def main():
         pass
     gs.run_command("r.mask",
                vector="watershed")
+
+    gs.run_command(
+        "r.mapcalc",
+        expression=(
+            "natural_depressions = if(isnull(dem_utm), null(), "
+            "if(dem_conditioned - dem_utm > 0, dem_conditioned - dem_utm, 0))"
+        ),
+        overwrite=True,
+    )
+
+    try:
+        gs.run_command("r.mask", flags="r")
+    except:
+        pass
     
     print("DEM imported into GRASS and region set to DEM extent.")
 
@@ -997,9 +975,6 @@ def main():
     plt.close()
 
     
-    dem_conditioned_path = str(Path(args.output) / "dem_conditioned.tif")
-    natural_depressions(input_dem, dem_conditioned_path, args.output)
-
     flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
                                                                                    hyperparam_threshold=HYPER_PARAM)
 
@@ -1134,7 +1109,6 @@ def main():
     rasters_to_export = {
             "flow_direction":       (flow_dir_ws, "Float32"),
             "flow_accumulation":    (flow_accumulation, "Float32"),
-            "natural_depressions":  ("natural_depressions", "Float32"),
             "stream_order":         ("strahler_order", "Int32"),
             "catchment_area_m2":    (catchment_area_rast, "Float32"),
             "catchment_stream_order": (catchment_order_rast, "Int32"),

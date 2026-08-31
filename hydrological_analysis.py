@@ -32,7 +32,6 @@ import rasterio
 import json
 import numpy as np
 import math
-import whitebox_workflows as wbw
 from dem_downloader import DEMDownloader
 import time
 import richdem as rd
@@ -178,12 +177,40 @@ def fill_sinks(dem_raster):
     return filled_dem, flow_dir
 '''
 
-def natural_depressions(input_dem, output_dir):
-    wbe = wbw.WbEnvironment()
-    dem_in = wbe.read_raster(input_dem)
-    depth_raster = wbe.hydrology.depth_in_sink(dem=dem_in)
-    wbe.write_raster(depth_raster, str(Path(output_dir) / "natural_depressions.tif"))
-    return None
+def natural_depressions(original_dem, filled_dem, output_dir):
+    import grass.script as gs
+
+    original_path = str(original_dem)
+    filled_path = str(filled_dem)
+
+    dem_source = "dem_natural_depressions_in"
+    dem_filled = "dem_filled_for_depressions"
+    depression_depth = "natural_depressions"
+    output_tif = str(Path(output_dir) / "natural_depressions.tif")
+
+    if os.path.exists(original_path):
+        gs.run_command("r.in.gdal", input=original_path, output=dem_source, overwrite=True)
+    else:
+        dem_source = original_dem
+
+    if os.path.exists(filled_path):
+        gs.run_command("r.in.gdal", input=filled_path, output=dem_filled, overwrite=True)
+    else:
+        dem_filled = filled_dem
+
+    expression = (
+        f"{depression_depth} = if(isnull({dem_source}), null(), {dem_filled} - {dem_source})"
+    )
+    gs.run_command("r.mapcalc", expression=expression, overwrite=True)
+    gs.run_command(
+        "r.out.gdal",
+        input=depression_depth,
+        output=output_tif,
+        format="GTiff",
+        overwrite=True,
+    )
+
+    return depression_depth
 
 def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
     import grass.script as gs
@@ -829,17 +856,29 @@ def compute_catchments_with_stream_order(
 
 def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict):
     import grass.script as gs
-    for name, raster in rasters_to_export.items():
+
+    for name, raster_spec in rasters_to_export.items():
+        if isinstance(raster_spec, dict):
+            raster_name = raster_spec["raster"]
+            raster_type = raster_spec.get("type", "Float32")
+        elif isinstance(raster_spec, tuple):
+            raster_name, raster_type = raster_spec
+        else:
+            raster_name = raster_spec
+            raster_type = "Float32"
+
         output_path = Path(output_dir) / f"{name}.tif"
-        gs.run_command("r.out.gdal",
-                   input=raster,
-                   output=str(output_path),
-                   format="GTiff",
-                   type="Float32",
-                   createopt="COMPRESS=LZW,PHOTOMETRIC=MINISBLACK",
-                   flags="f",
-                   overwrite=True)
-        print(f"Exported raster: {output_path}")
+        gs.run_command(
+            "r.out.gdal",
+            input=raster_name,
+            output=str(output_path),
+            format="GTiff",
+            type=raster_type,
+            createopt="COMPRESS=LZW,PHOTOMETRIC=MINISBLACK",
+            flags="f",
+            overwrite=True,
+        )
+        print(f"Exported raster: {output_path} ({raster_type})")
 
     for name, (vector, geom_type) in vectors_to_export.items():
         output_path = Path(output_dir) / f"{name}.geojson"
@@ -958,11 +997,9 @@ def main():
     plt.close()
 
     
-    # dem_filled, _ = fill_sinks("dem_utm")
-    
-    natural_depressions(input_dem, args.output)
-    
-    
+    dem_conditioned_path = str(Path(args.output) / "dem_conditioned.tif")
+    natural_depressions(input_dem, dem_conditioned_path, args.output)
+
     flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
                                                                                    hyperparam_threshold=HYPER_PARAM)
 
@@ -1095,14 +1132,14 @@ def main():
 
     gs.run_command("r.mask", flags="r")
     rasters_to_export = {
-            "flow_direction":       flow_dir_ws,
-            "flow_accumulation":    flow_accumulation,
-            #"natural_depressions":  depressions,
-            "stream_order":         "strahler_order",
-            "catchment_area_m2":    catchment_area_rast,
-            "catchment_stream_order":  catchment_order_rast, 
-            "flow_direction_stream": flow_dir_st,
-            "streams_raster": "streams_rast" 
+            "flow_direction":       (flow_dir_ws, "Float32"),
+            "flow_accumulation":    (flow_accumulation, "Float32"),
+            "natural_depressions":  ("natural_depressions", "Float32"),
+            "stream_order":         ("strahler_order", "Int32"),
+            "catchment_area_m2":    (catchment_area_rast, "Float32"),
+            "catchment_stream_order": (catchment_order_rast, "Int32"),
+            "flow_direction_stream": (flow_dir_st, "Float32"),
+            "streams_raster":       ("streams_rast", "Int32"),
         }
     vectors_to_export = {
             "streams":              ("streams_with_order", "line"),

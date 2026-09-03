@@ -1048,9 +1048,23 @@ def main():
 
     gs.run_command("r.to.vect",
             input=micro_watersheds,
-            output="watersheds_vect",
+            output="watersheds_vect_raw",
             type="area",
             overwrite=True)
+
+    # Remove tiny sliver polygons created during raster-to-vector conversion.
+    region = gs.region()
+    cell_area_m2 = abs(float(region["ewres"]) * float(region["nsres"]))
+    sliver_area_m2 = max(cell_area_m2 * 3.0, args.min_watershed_size * 10000 * 0.05)
+    gs.run_command(
+        "v.clean",
+        input="watersheds_vect_raw",
+        output="watersheds_vect",
+        type="area",
+        tool="rmarea",
+        threshold=str(sliver_area_m2),
+        overwrite=True,
+    )
 
     edges, basin_centroids, basin_ids = compute_mws_connectivity(
         micro_watersheds_rast=micro_watersheds,

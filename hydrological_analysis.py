@@ -134,12 +134,16 @@ def get_utm_epsg_for_bbox(bbox):
     else:
         raise ValueError("No suitable UTM CRS found for the given AOI.")
 
-def dem_preprocessing(input_dem, output_dir):
+def dem_preprocessing(input_dem, output_dir, watershed_path=None):
+    from rasterio import features as rasterio_features
+
     conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
     depression_tif = str(Path(output_dir) / "natural_depressions.tif")
 
     with rasterio.open(input_dem) as src:
         nodata = src.nodata
+        transform = src.transform
+        crs = src.crs
 
     if nodata is None:
         nodata = -9999.0
@@ -152,9 +156,25 @@ def dem_preprocessing(input_dem, output_dir):
     dem_arr = np.asarray(dem_in)
     filled_arr = np.asarray(filled_dem)
     depth = filled_arr - dem_arr
+
+    watershed_mask = np.ones(dem_arr.shape, dtype=bool)
+    if watershed_path is not None:
+        watershed_gdf = gpd.read_file(watershed_path)
+        if not watershed_gdf.empty:
+            if watershed_gdf.crs is not None and crs is not None:
+                watershed_gdf = watershed_gdf.to_crs(crs)
+            watershed_mask = rasterio_features.geometry_mask(
+                [geom for geom in watershed_gdf.geometry if geom is not None],
+                out_shape=dem_arr.shape,
+                transform=transform,
+                invert=True,
+                all_touched=False,
+            )
+
     nodata_mask = dem_arr == dem_in.no_data
-    depth[nodata_mask] = dem_in.no_data
-    depth[~nodata_mask] = np.clip(depth[~nodata_mask], 0, None)
+    valid_mask = (~nodata_mask) & watershed_mask
+    depth[~valid_mask] = dem_in.no_data
+    depth[valid_mask] = np.clip(depth[valid_mask], 0, None)
 
     depth_rd = rd.rdarray(depth, no_data=dem_in.no_data)
     depth_rd.geotransform = dem_in.geotransform
@@ -919,7 +939,13 @@ def main():
 
     input_dem = str(Path(args.output) / f"dem_{epsg}.tif")
     output_dir = Path(args.output).resolve()
-    dem_conditioned = dem_preprocessing(input_dem, output_dir)
+    watershed_utm_path = Path(args.output) / "watershed_utm.shp"
+    watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
+    dem_conditioned = dem_preprocessing(
+        input_dem,
+        output_dir,
+        watershed_path=str(watershed_utm_path),
+    )
 
     gs.run_command("r.in.gdal",
                input=input_dem,
@@ -934,8 +960,6 @@ def main():
 
     gs.run_command("g.region", raster="dem_conditioned", flags="p")
 
-    watershed_utm_path = Path(args.output) / "watershed_utm.shp"
-    watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
     gs.run_command("v.in.ogr",
                    input=str(watershed_utm_path),
                    output="watershed",

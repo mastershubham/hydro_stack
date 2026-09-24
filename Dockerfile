@@ -6,14 +6,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     grass=8.3.2-1ubuntu2 \
-    make=4.3-4.1build2 \
     grass-dev=8.3.2-1ubuntu2 \
-    build-essential=12.10ubuntu1 \
-    python3-pip=24.0+dfsg-1ubuntu1.3 \
-    python3-dev=3.12.3-0ubuntu2.1 \
-    python3-venv=3.12.3-0ubuntu2.1 \
-    git=2.43.0-1ubuntu7.3 \
-    ca-certificates=20260601~24.04.1 \
+    make \
+    build-essential \
+    python3-pip \
+    python3-dev \
+    python3-venv \
+    git \
+    ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

@@ -4,17 +4,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    grass \
-    make \
-    grass-dev \
-    gdal-bin \
-    libgdal-dev \
-    build-essential \
-    python3-pip \
-    python3-dev \
-    python3-venv \
-    git \
-    ca-certificates \
+    grass=8.3.2 \
+    make=4.3 \
+    grass-dev=8.3.2 \
+    gdal-bin=3.8.4 \
+    libgdal-dev=3.8.4 \
+    build-essential=12.10 \
+    python3-pip=24.0 \
+    python3-dev=3.12.3 \
+    python3-venv=3.12.3 \
+    git=2.43.0 \
+    ca-certificates=20260601 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

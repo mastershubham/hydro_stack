@@ -2,7 +2,9 @@
 FROM ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     grass=8.3.2-1ubuntu2 \

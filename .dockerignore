@@ -1,3 +1,8 @@
 # Ignore the experiments folder(the notebook and the environment files)
 /experiments
+/data
+/__pycache__
+/images
+/LICENSE
+/README.md
   

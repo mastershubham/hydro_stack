@@ -1,20 +1,19 @@
+# GDAL 3.12.2 "Chicoutimi"
 FROM ghcr.io/osgeo/gdal:ubuntu-small-3.12.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    grass=8.3.2 \
-    make=4.3 \
-    grass-dev=8.3.2 \
-    gdal-bin=3.8.4 \
-    libgdal-dev=3.8.4 \
-    build-essential=12.10 \
-    python3-pip=24.0 \
-    python3-dev=3.12.3 \
-    python3-venv=3.12.3 \
-    git=2.43.0 \
-    ca-certificates=20260601 \
+    grass=8.3.2-1ubuntu2 \
+    make=4.3-4.1build2 \
+    grass-dev=8.3.2-1ubuntu2 \
+    build-essential=12.10ubuntu1 \
+    python3-pip=24.0+dfsg-1ubuntu1.3 \
+    python3-dev=3.12.3-0ubuntu2.1 \
+    python3-venv=3.12.3-0ubuntu2.1 \
+    git=2.43.0-1ubuntu7.3 \
+    ca-certificates=20260601~24.04.1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

@@ -1,5 +1,5 @@
-geopandas
-rasterio
-matplotlib
-richdem2
-fabdem
+geopandas=1.1.4
+rasterio=1.5.1
+matplotlib=3.11.2
+richdem2=2.4.3
+fabdem=0.2.2

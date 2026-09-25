@@ -15,6 +15,12 @@ The workflow is designed to run in a Linux based execution environment. The work
 For smaller regions of interest, the workflow can run even on laptops with 8 GB RAM. But workstations with higher RAM and better processing speed would permit larger level analysis. 
 
 Comment: For analysis of basins of size ~150,000 sq.kms., we used a workstation with 128 GB RAM, 12 Core CPU and with processor speed of 3.6 GHz. 
+
+## Reproducible Environment
+
+We have used containerization technology (using Docker) and also pinned down the versions of the system level packages which are required for computation. These are specified in the Dockerfile. The python packages are specified in requirements.txt and their version is also pinned. 
+
+The codes and algorithms are deterministic and any variation in the output with the same input region of interest could be attributed to the variation in the DEM/DSM used or modified core algorithms in the geospatial packages (grass, gdal) (we have thus pinned the version to reduce this).  
 ## Setup for running the workflow
 Here we provide detailed instructions to setup and run the workflow. 
 

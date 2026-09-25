@@ -9,7 +9,7 @@ One of our key contributions also include the micro-watershed merging algorithm 
 Fig: The flowchart describing the modules and the data flow
 
 ## Architecture and environment requirement
-The workflow is designed to run in a Linux based execution environment. The workflow is packaged inside a Docker container and thus it can be deployed on any AMD64 and ARM64 based device provide it supports Docker and the Docker environment is configured to provide network access to the container.
+The workflow is designed to run in a Linux based execution environment. The workflow is packaged inside a Docker container and thus it can be deployed on any AMD64 and ARM64 based device provided it supports Docker and the Docker environment is configured to provide network access to the container.
 
 ## Hardware Related Requirements
 For smaller regions of interest, the workflow can run even on laptops with 8 GB RAM. But workstations with higher RAM and better processing speed would permit larger level analysis. 

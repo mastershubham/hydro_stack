@@ -1,23 +1,21 @@
 '''
-GRASS GIS based hydrological analysis
-=====================================
+Hydrological analysis pipeline for a watershed boundary
+=====================================================
 Author: Shubham Kumar
 Date: April 2026
--------------------------------------
-Usage: 
+
+Usage:
     python hydrological_analysis.py --shp path_to_shapefile \
         --output path_to_output_directory \
         --threshold flow_accumulation_threshold
 
-Description:
-    Given a shapefile of a hydrological unit (e.g., a watershed), this script performs the following steps:
-    1. Sets up a GRASS GIS environment.
-    2. Imports the shapefile and a Digital Elevation Model (DEM) into GRASS GIS.
-    3. Fills sinks in the DEM to ensure proper flow direction.
-    4. Calculates flow direction and flow accumulation.
-    5. Extracts stream networks based on a specified flow accumulation threshold.
-    6. Exports the resulting stream network as a GeoJSON file for visualization and further analysis.
-
+Workflow:
+    1. Select a suitable UTM CRS for the watershed footprint.
+    2. Download and reproject the DEM to the local watershed extent.
+    3. Condition the DEM for hydrologic processing and limit analysis to the polygon.
+    4. Run GRASS flow-direction and flow-accumulation routines.
+    5. Extract stream networks and derive stream order.
+    6. Merge small micro-watersheds and export the derived raster/vector outputs.
 '''
 
 import geopandas as gpd
@@ -36,20 +34,26 @@ from dem_downloader import DEMDownloader
 import time
 import richdem as rd
 
-MIN_WATERSHED_SIZE = 500 # 500 hectares
-HYPER_PARAM = 1200 # Initial threshold for r.watershed. 1200 cells. 
+# Minimum area used when merging tiny micro-watersheds; expressed in hectares.
+MIN_WATERSHED_SIZE = 500
+# Initial r.watershed accumulation threshold in cells for preliminary basin delineation.
+# This should later be tied to DEM resolution and target watershed scale.
+HYPER_PARAM = 1200
 
 CONFIG = {
-    "DEM": "srtm30"
+    "DEM": "srtm30"  # DEM key used by DEMDownloader; see dem_downloader.py for registry details.
 }
 
+# CLI arguments for the watershed processing pipeline. These flags control the input
+# polygon, output directory, GRASS database, and the hydrologic thresholds used to
+# derive stream networks and final micro-watershed units.
 def parse_args():
     parser = argparse.ArgumentParser(
         description="GRASS GIS Hydrological Analysis Pipeline"
     )
     parser.add_argument(
         "--shp", required=True,
-        help="Path to input shapefile defining the watershed boundary"
+        help="Path to input vector defining the watershed boundary"
     )
     parser.add_argument(
         "--output", required=True,
@@ -70,6 +74,7 @@ def parse_args():
 
     return parser.parse_args()
 
+# Initialize a GRASS GIS session and load the Python bindings used by the workflow.
 def setup_grass_session(grassdb: str, epsg: int, project_name: str = "hydro_project"):
     grassdb_path = Path(grassdb).resolve()
     location = project_name
@@ -97,7 +102,8 @@ def setup_grass_session(grassdb: str, epsg: int, project_name: str = "hydro_proj
                        check=True)
         print(f"[INFO] GRASS location created: {loc_path}")
 
-    # Trying grass_session first, fall back to gsetup
+    # Prefer the Session API when available; otherwise initialize GRASS using the
+    # lower-level setup helper.
     try:
         from grass_session import Session
         session = Session()
@@ -107,12 +113,13 @@ def setup_grass_session(grassdb: str, epsg: int, project_name: str = "hydro_proj
     except ImportError:
         pass
 
-    # Fallback: manual gsetup
+    # Legacy fallback for environments without grass_session installed.
     import grass.script.setup as gsetup
     gsetup.init(str(grassdb_path), location, mapset)
     print("GRASS environment initialised via grass.script.setup")
     return None
 
+# Pick the most suitable UTM CRS for the watershed footprint from its bounding box.
 def get_utm_epsg_for_bbox(bbox):
     west, south, east, north = bbox
     
@@ -130,10 +137,15 @@ def get_utm_epsg_for_bbox(bbox):
     )
 
     if utm_info:
+        # A single UTM zone is returned for the full AOI; this is sufficient for
+        # watershed-scale work, but broader areas may need a tiled strategy.
         return utm_info[0].code
     else:
         raise ValueError("No suitable UTM CRS found for the given AOI.")
 
+# Condition the DEM for hydrologic processing by removing sinks, recording depression depth,
+# and reducing the analysis extent to the watershed polygon when one is supplied. This creates
+# a terrain surface that is suitable for D8 flow routing and stream extraction.
 def dem_preprocessing(input_dem, output_dir, watershed_path=None):
     from rasterio import features as rasterio_features
 
@@ -155,8 +167,9 @@ def dem_preprocessing(input_dem, output_dir, watershed_path=None):
 
     dem_arr = np.asarray(dem_in)
     filled_arr = np.asarray(filled_dem)
-    depth = filled_arr - dem_arr
+    depth = filled_arr - dem_arr # The depressions (natural and artificial) will appear as positive values. Inverted-depth map.
 
+    # Restrict downstream calculations and exports to the watershed polygon when provided.
     watershed_mask = np.ones(dem_arr.shape, dtype=bool)
     if watershed_path is not None:
         watershed_gdf = gpd.read_file(watershed_path)
@@ -181,7 +194,7 @@ def dem_preprocessing(input_dem, output_dir, watershed_path=None):
     depth_rd.projection = dem_in.projection
     rd.SaveGDAL(depression_tif, depth_rd)
 
-    rd.ResolveFlats(filled_dem, in_place=True)
+    rd.ResolveFlats(filled_dem, in_place=True) # Adding a small gradient to the filled DEM to resolve flats.
     rd.SaveGDAL(conditioned_dem, filled_dem)
 
     return filled_dem
@@ -189,13 +202,14 @@ def dem_preprocessing(input_dem, output_dir, watershed_path=None):
 def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
     import grass.script as gs
     gs.run_command("r.watershed", 
-                elevation=dem_filled, 
-                accumulation="flow_acc", 
+                elevation=dem_filled,
+                accumulation="flow_acc",
                 drainage="flow_dir_watershed",
-                threshold=hyperparam_threshold, 
+                threshold=hyperparam_threshold,
+                # Use a low threshold so the earliest basin partition captures fine-scale drainage.
                 basin="micro_watersheds",
                 #stream="streams_raw",
-                flags="as",          # -a: positive accumulation; -s: single-flow (D8) 
+                flags="as",  # -a: positive accumulation; -s: single-flow (D8)
                 overwrite=True)
 
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
@@ -209,27 +223,11 @@ def merge_small_watersheds(
     output_rast: str = "micro_watersheds",
 ) -> str:
     """
-    Hybrid implementation: hydrologically correct merge logic from the
-    original, with O(n) vectorized topology construction replacing the
-    O(n*b) per-basin np.where() loop.
+    Merge tiny micro-watersheds upward until each basin reaches the minimum area.
 
-    Changes from the original
-    ─────────────────────────
-    1. _build_maps replaced by _build_maps_vectorized   → O(n) per call
-       instead of O(n*b).  All merge logic is UNCHANGED.
-    2. unmergeable is reset every iteration so basins that gain a neighbour
-       after an earlier merge are retried.
-    3. upstream[C] deduplication prevents repeated IDs from accumulating
-       when multiple basins merge into the same target in one pass.
-    4. area_cells built with np.bincount instead of repeated np.sum.
-
-    No Union-Find.  No deferred array writes.  Merge direction is always
-    preserved: bid (small) → target (downstream or largest upstream).
-
-    Complexity
-    ──────────
-    Per iteration : O(n + b log b)   [vectorized topology + sort]
-    Total         : O(k * (n + b log b))  where k ≤ b iterations
+    The merge logic follows the original hydrologic pattern: a small basin is
+    absorbed into its downstream neighbour when possible, otherwise into the
+    largest upstream neighbour that still exists in the current topology.
     """
     import numpy as np
     import grass.script as gs
@@ -247,7 +245,7 @@ def merge_small_watersheds(
         8: ( 0, +1),   # E
     }
 
-    # ── GRASS region metadata ──────────────────────────────────────────────
+    # Pull the current GRASS region geometry and cell size to convert raster area to hectares.
     region    = gs.region()
     nrows     = int(region["rows"])
     ncols     = int(region["cols"])
@@ -259,7 +257,7 @@ def merge_small_watersheds(
         f": min_cells = {min_cells:.1f}"
     )
 
-    # ── Load rasters ───────────────────────────────────────────────────────
+    # Load the generated micro-watershed raster and the supporting drainage rasters.
     gs.run_command(
         "r.mapcalc",
         expr=f"_mws_work = int({micro_watersheds_rast})",
@@ -274,7 +272,10 @@ def merge_small_watersheds(
     for _d, (_dr, _dc) in DIR_OFFSETS.items():
         _offset_lut[_d] = (_dr, _dc)
 
-    # ── Vectorized topology builder  O(n) ─────────────────────────────────
+    # Build the drainage topology in a vectorized way so the merge pass can process
+    # many basins without the original basin-by-basin loop. The resulting dictionaries
+    # describe each basin's outlet, area, and upstream neighbours, which are the pieces
+    # needed to decide how to absorb tiny basins without breaking the D8 drainage graph.
     def _build_maps_vectorized(basin_arr):
         """
         Fully vectorized replacement for the original _build_maps().
@@ -295,7 +296,9 @@ def merge_small_watersheds(
         """
         valid_mask = (basin_arr > 0) & (basin_arr != -9999)
 
-        # ── area_cells via bincount ────────────────────────────────────────
+        # Count the cells in each basin using np.bincount. This is faster and more stable than
+        # repeatedly summing each basin's footprint, and it gives the area information required
+        # for the minimum-size merge threshold.
         flat_valid = basin_arr[valid_mask]
         if flat_valid.size == 0:
             return {}, {}, {}
@@ -303,7 +306,8 @@ def merge_small_watersheds(
         valid_ids  = np.flatnonzero(counts).astype(np.int32)
         area_cells = {int(i): int(counts[i]) for i in valid_ids}
 
-        # ── vectorized neighbour coordinates ──────────────────────────────
+        # Map each D8 flow-direction cell to the neighbour it drains toward. The offset table is
+        # used to compute the candidate downstream cell for every valid raster cell in one pass.
         R, C  = np.indices((nrows, ncols), dtype=np.int32)
         d_raw = flowdir_arr.astype(np.int32)
         d_clip = np.where((d_raw >= 1) & (d_raw <= 8), d_raw, 0)
@@ -325,7 +329,9 @@ def merge_small_watersheds(
         ib_basin  = is_basin & has_valid_dir & in_bounds
         nbr_basin[ib_basin] = basin_arr[safe_r[ib_basin], safe_c[ib_basin]]
 
-        # ── candidate pour-point mask ──────────────────────────────────────
+        # A cell is considered a candidate outlet when it drains outside the grid or into a
+        # different basin. These are the natural pour points used to identify each basin's link
+        # to the downstream network.
         is_outlet_cell = is_basin & has_valid_dir & (~in_bounds)
         is_cross_basin = (
             is_basin & has_valid_dir & in_bounds
@@ -350,9 +356,9 @@ def merge_small_watersheds(
         )
         cand_acc = acc_arr[cr, cc]
 
-        # ── argmax-per-basin via lexsort  O(c log c) ──────────────────────
-        # Sort by (basin_id ASC, accumulation DESC); first occurrence per
-        # basin_id is the pour point with the highest accumulation.
+        # Choose the single strongest outlet per basin by sorting each candidate outlet in
+        # descending accumulation. The first occurrence per basin_id therefore corresponds to the
+        # dominant pour point, which is the correct outlet for connectivity and merge decisions.
         order     = np.lexsort((-cand_acc, cand_bid))
         bid_s     = cand_bid[order]
         tgt_s     = cand_target[order]
@@ -374,7 +380,9 @@ def merge_small_watersheds(
 
         return downstream, area_cells, upstream
 
-    # ── Iterative merge  (logic IDENTICAL to original) ────────────────────
+    # Repeat until all remaining basins satisfy the minimum area threshold or cannot be merged
+    # without violating the drainage topology. This is the iterative cleanup step that turns the
+    # initial fine-grained basin partition into a more hydrologically appropriate watershed map.
     iteration    = 0
     total_merged = 0
 
@@ -471,7 +479,9 @@ def merge_small_watersheds(
                 )
             break
 
-    # ── Renumber to compact sequential IDs (original trick) ───────────────
+    # Renumber the final basin IDs to a compact, sequential set for downstream GRASS processing.
+    # A compact ID set is simpler to handle in the later raster/vector conversion and makes the
+    # basin graph easier to inspect and attribute in GRASS tables.
     final_ids = np.unique(basin_arr)
     final_ids = final_ids[(final_ids > 0) & (final_ids != -9999)]
     new_id = 1
@@ -481,7 +491,8 @@ def merge_small_watersheds(
     basin_arr = -basin_arr
     basin_arr[basin_arr == 9999] = -9999
 
-    # ── Write result back to GRASS ─────────────────────────────────────────
+    # Write the merged basin raster back into GRASS so the rest of the pipeline can work
+    # with a clean, compact watershed partition instead of the original fine-grained micro-basins.
     import tempfile, os
     import rasterio
     from rasterio.transform import from_bounds
@@ -537,6 +548,8 @@ def compute_pour_points(micro_watersheds_rast: str,
     from grass.script import array as garray
     import tempfile, csv
 
+    # A pour point is the cell in each basin that drains to a different basin, or to the edge
+    # of the domain. These are the true outlet cells that later support connectivity graphing.
     print("Pour Points: locating true outlet cell for each micro-watershed …")
 
     region  = gs.region()
@@ -650,7 +663,7 @@ def compute_catchment_area(flow_acc_rast: str,
  
     print("Catchment area: Computing contributing area in m² …")
  
-    # Retrieving current region resolution
+    # Convert the flow-accumulation count to physical area using cell size.
     region = gs.region()
     cell_area = abs(region["nsres"]) * abs(region["ewres"])
     print(f"Catchment area: Cell area = {cell_area:.2f} m²")
@@ -679,6 +692,9 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
     import grass.script as gs
     from grass.script import array as garray
 
+    # Build a directed graph of micro-watershed relationships. Each outlet cell defines one edge
+    # from a source basin to the downstream basin it drains into, which is later used for
+    # visualization and attribute enrichment.
     print("MWS connectivity: building micro-watershed connectivity graph …")
 
     region  = gs.region()
@@ -779,6 +795,8 @@ def compute_catchments_with_stream_order(
     import grass.script as gs
     import tempfile, os
 
+    # Align the region with the flow-direction raster so the stream-basin segmentation operates on
+    # the same grid as the rest of the drainage analysis.
     gs.run_command("g.region", raster=flow_dir_rast, flags="a")
 
     seg_basins_rast = "tmp_seg_basins"
@@ -790,6 +808,8 @@ def compute_catchments_with_stream_order(
         overwrite=True
     )
 
+    # Read the stream segment IDs together with their Strahler order so we can rebuild a map in
+    # which each segment's basin inherits the order of the stream it drains into.
     raw = gs.read_command(
         "r.stats",
         input=f"{streams_rast},{strahler_rast}",
@@ -841,6 +861,8 @@ def compute_catchments_with_stream_order(
 def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict):
     import grass.script as gs
 
+    # Export the derived products to GeoTIFF and GeoJSON so the final hydrologic outputs can be
+    # inspected externally in GIS tools, notebooks, or downstream analysis scripts.
     for name, raster_spec in rasters_to_export.items():
         if isinstance(raster_spec, dict):
             raster_name = raster_spec["raster"]
@@ -881,7 +903,7 @@ def main():
 
     os.makedirs(args.output, exist_ok=True)
 
-    # Reading shapefile and determining UTM zone
+    # Load the watershed boundary and establish the local projected CRS used for DEM and flow calculations.
     watershed_gdf = gpd.read_file(args.shp)
     watershed_gdf = watershed_gdf.to_crs(epsg=4326)  
 
@@ -896,6 +918,8 @@ def main():
     bbox = (minx -buffer, miny -buffer, maxx +buffer, maxy +buffer)
     epsg = get_utm_epsg_for_bbox(bbox)
 
+    # Download a DEM that covers the buffered watershed footprint. Using the polygon bounds and a
+    # small margin avoids edge artifacts while keeping the raster manageable at the watershed scale.
     location_of_dem = Path(args.output) / "dem_raw.tif"
     location_of_dem = location_of_dem.resolve()
 
@@ -926,6 +950,8 @@ def main():
     plt.close()
     
     name_of_proj = Path(args.output).resolve().name
+    # Initialize GRASS in the same projected CRS as the DEM so all raster operations share a
+    # consistent spatial reference and cell geometry.
     session = setup_grass_session(args.grassdb, epsg, name_of_proj)
     
     import grass.script as gs
@@ -958,6 +984,8 @@ def main():
                overwrite=True)
     
 
+    # Set the GRASS computational region to the conditioned DEM so all vector and raster tools
+    # operate on the same grid resolution and spatial extent.
     gs.run_command("g.region", raster="dem_conditioned", flags="p")
 
     gs.run_command("v.in.ogr",
@@ -976,6 +1004,7 @@ def main():
     
     print("DEM imported into GRASS and region set to DEM extent.")
 
+    # Plotting the UTM DEM helps confirm the imported extent, grid alignment, and boundary mask.
     fig, ax = plt.subplots(figsize=(10, 8))
 
     dem_path = Path(args.output) / f"dem_{epsg}.tif"
@@ -987,11 +1016,15 @@ def main():
     plt.close()
 
     
+    # Compute the flow direction, flow accumulation, and initial micro-watershed partition.
+    # These rasters are the foundation for stream extraction and downstream basin merging.
     flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
                                                                                    hyperparam_threshold=HYPER_PARAM)
 
     flow_dir_st = "flow_dir_st"
     gs.run_command("r.mask", flags="r")
+    # Extract the stream network from the current DEM and accumulation surface. The threshold
+    # controls how much upstream contributing area is needed before a channel is considered a stream.
     gs.run_command("r.stream.extract",
                elevation="dem_conditioned",
                accumulation=flow_accumulation,
@@ -1001,6 +1034,8 @@ def main():
                threshold=args.threshold, 
                overwrite=True)
 
+    # Derive stream ordering from the extracted network so each channel segment carries a
+    # Strahler/Shreve designation that can be mapped back to catchments and exported downstream.
     gs.run_command("r.stream.order",
                stream_rast="streams_rast",
                direction=flow_dir_st,
@@ -1017,6 +1052,8 @@ def main():
     flow_dir_rast=flow_dir_st,
     output_rast="catchment_stream_order")
     
+    # Reapply the watershed mask before basin merging so the merge logic operates only within
+    # the study polygon and does not join cells outside the hydrologic unit.
     gs.run_command("r.mask", vector="watershed")
   
     micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
@@ -1102,6 +1139,9 @@ def main():
         map="watersheds_vect",
         columns="basin_id int, downstream_id int, upstream_ids varchar(256), flow_direction double precision")
     
+    # Each vector feature is assigned the basin ID and then enriched with the downstream and
+    # upstream relationships from the connectivity graph. This makes the vector dataset queryable
+    # and suitable for reporting or map styling.
     gs.run_command("v.db.update", map="watersheds_vect", column="basin_id", query_column="value")
 
 
@@ -1113,6 +1153,9 @@ def main():
 
     
     for bid in map(int, basin_ids):
+        # For each basin, attach the downstream basin, the sequence of upstream neighbours, and a
+        # bearing angle derived from the centroid-to-centroid direction. These are useful for
+        # hydrologic interpretation and visual exploration.
         ds = downstream_map.get(bid)
         us = upstream_map.get(bid, [])
         bearing = None

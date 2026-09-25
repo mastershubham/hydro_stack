@@ -20,7 +20,10 @@ Comment: For analysis of basins of size ~150,000 sq.kms., we used a workstation 
 
 We have used containerization technology (using Docker) and also pinned down the versions of the system level packages which are required for computation. These are specified in the Dockerfile. The python packages are specified in requirements.txt and their version is also pinned. 
 
-The codes and algorithms are deterministic and any variation in the output with the same input region of interest could be attributed to the variation in the DEM/DSM used or modified core algorithms in the geospatial packages (grass, gdal) (we have thus pinned the version to reduce this).  
+The codes and algorithms are deterministic and any variation in the output with the same input region of interest could be attributed to the variation in the DEM/DSM used, modified core algorithms in the geospatial packages (grass, gdal) (we have thus pinned the version to reduce this), or changes anywhere in the workflow.
+
+Given identical inputs, software versions, configuration, and execution environment, it is expected to produce identical results.
+
 ## Setup for running the workflow
 Here we provide detailed instructions to setup and run the workflow. 
 

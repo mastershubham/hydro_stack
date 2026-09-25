@@ -95,4 +95,4 @@ Again, at the start of the script, one has to specify the path of the appropriat
 
 ## Analyzing the distribution of areas of the micro-watersheds
 
-One can use the scripts provided at [mastershubahm/hydrology_eval](https://github.com/mastershubham/hydrology_eval) to analyze the distribution of the areas of the micro-watersheds generated through this workflow. 
+One can use the scripts provided at [mastershubham/hydrology_eval](https://github.com/mastershubham/hydrology_eval) to analyze the distribution of the areas of the micro-watersheds generated through this workflow. 

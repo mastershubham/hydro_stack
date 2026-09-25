@@ -59,7 +59,7 @@ We are also mounting the present working directory (pwd) into the container at t
 echo "OPEN_TOPOGRAPHY_KEY" > ~/.opentopography.txt
 ```
 
-6. Finally, you can run the below python command from inside the container. It take input the path to the watershed vector through `--shp` parameter and outputs the generated maps and some intermediate files in the specified output directory (following the `--output` parameter). 
+6. Finally, you can run the below python command from inside the container. It takes input as the path to the watershed vector through `--shp` parameter and outputs the generated maps and some intermediate files in the specified output directory (following the `--output` parameter). 
 
 For example, we have given a region (it is an administrative region and not a watershed, but for sake of demonstration we can run our analysis on it) in the data directory. The corresponding code runs the analysis pipeline for the region.
 

@@ -105,3 +105,11 @@ Again, at the start of the script, one has to specify the path of the appropriat
 ## Analyzing the distribution of areas of the micro-watersheds
 
 One can use the scripts provided at [mastershubham/hydrology_eval](https://github.com/mastershubham/hydrology_eval) to analyze the distribution of the areas of the micro-watersheds generated through this workflow. 
+
+## Extending the HydroSHEDS framework
+
+HydroSHEDS is a global hydrography mapping project which provides the base hydrological layers like flow direction, flow accumulation, drainage networks, pour points, watershed basins, etc. with global coverage. The limitations of their approach is that their product is static (cannot be modified and adapted), and coarse (at coarser DEM resolution and larger size of sub-basins). Also their methodology is not exposed as a configurable pipeline that can be adapted. Our workflow can take a HydroBASIN (a sub-basin of HydroSHEDS say at level 5) and delineate micro-watersheds automatically. This will help in local level water management initiatives. We along with micro-watershed delineation of a basin/sub-basin, provide other hydro-geomorphic layers such as pour points, drainage networks,  
+
+The HydroBASIN products can be found at: [HydroBASINS](https://www.hydrosheds.org/products/hydrobasins)
+
+There is HydroSHEDS v2 coming up. It is already out for South America and North America. Despite these new products, the methodology is not exposed as a configurable workflow that could be adapted for local planning. Our product is going to be relevant still then.  

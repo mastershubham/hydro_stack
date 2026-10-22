@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+/dem_cache/
+/masalia/
+/sakra_ws1/
+/watershed_connectivity.png
+/watershed_1449_gdf.*

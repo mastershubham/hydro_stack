@@ -36,6 +36,7 @@ import richdem as rd
 
 # Minimum area used when merging tiny micro-watersheds; expressed in hectares.
 MIN_WATERSHED_SIZE = 500
+MAX_MERGED_WATERSHED_SIZE_HA = 1500
 # Initial r.watershed accumulation threshold in cells for preliminary basin delineation.
 # This should later be tied to DEM resolution and target watershed scale.
 HYPER_PARAM = 1200
@@ -69,7 +70,7 @@ def parse_args():
     )
     parser.add_argument(
         "--min_watershed_size", type=int, default=MIN_WATERSHED_SIZE,
-        help="Minimum watershed size in cells (default: 500 hectares)"
+        help="Minimum watershed size in hectares (default: 500 hectares)"
     )
 
     return parser.parse_args()
@@ -251,10 +252,12 @@ def merge_small_watersheds(
     ncols     = int(region["cols"])
     cell_ha   = abs(region["nsres"]) * abs(region["ewres"]) / 10_000.0
     min_cells = min_area_ha / cell_ha
+    max_cells = MAX_MERGED_WATERSHED_SIZE_HA / cell_ha
 
     print(
         f"[merge_small_watersheds] cell = {cell_ha:.4f} ha  "
-        f": min_cells = {min_cells:.1f}"
+        f": min_cells = {min_cells:.1f}, "
+        f"max_target_cells = {max_cells:.1f}"
     )
 
     # Load the generated micro-watershed raster and the supporting drainage rasters.
@@ -432,6 +435,16 @@ def merge_small_watersheds(
                     )
                     continue
                 target = max(us_ids, key=lambda u: area_cells[u])
+
+            merged_area = area_cells[target] + current_area
+            if merged_area > max_cells:
+                unmergeable.add(bid)
+                print(
+                    f"[merge_small_watersheds] NOTE: merging basin {bid} into "
+                    f"{target} would exceed the {MAX_MERGED_WATERSHED_SIZE_HA} "
+                    "ha target limit – skipping."
+                )
+                continue
 
             # ── Apply merge: relabel bid → target in the array ────────────
             # This is the ORIGINAL mechanism. No Union-Find. Merge direction

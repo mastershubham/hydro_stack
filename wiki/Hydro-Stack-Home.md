@@ -491,7 +491,7 @@ Hierarchical ranking: headwater streams = order 1; when two equal-order streams 
 Additive alternative: every confluence sums the orders of its tributaries. More sensitive to total upstream network complexity. Computed but not currently propagated to final outputs.
 
 ### Micro-watershed Merging
-`r.watershed` produces an initial fine-grained basin segmentation. Many basins are too small to be practically useful. The `merge_small_watersheds()` function iteratively consolidates any basin below `--min_watershed_size` (hectares) into a hydrologically appropriate neighbor — preferring downstream basin, falling back to largest upstream basin at true outlets. Repeats until all basins meet threshold or no valid merge target remains.
+`r.watershed` produces an initial fine-grained basin segmentation. Many basins are too small to be practically useful. The `merge_small_watersheds()` function iteratively consolidates any basin below `--min_watershed_size` (hectares) into a hydrologically appropriate neighbor — preferring downstream basin, falling back to largest upstream basin at true outlets. A merge is skipped if it would make the target basin exceed 1,500 hectares. Repeats until all basins meet the minimum threshold or no valid merge target remains; the maximum-size limit can therefore leave a basin below the minimum.
 
 ### Pour Point
 The single outlet cell of a basin — the boundary cell through which all contributing flow exits, identified as the maximum-accumulation boundary cell whose downstream neighbor lies outside the basin. Computed in `compute_pour_points()` and reused as anchor points for basin connectivity graph construction.
@@ -613,4 +613,3 @@ hydro_stack/
 Hydro Stack is a comprehensive, containerized pipeline for reproducible hydrological analysis. It abstracts complex geospatial data handling and GRASS GIS workflows into a simple CLI, enabling non-experts to perform professional-grade watershed analysis. The architecture leans on mature, peer-reviewed algorithms (GRASS hydrological modules) while adding custom NumPy-vectorized post-processing for basin merging and connectivity — balancing scientific rigor with practical usability.
 
 For researchers, the pipeline supports rapid watershed characterization across study regions; for hydrologists, it provides reproducible, version-controlled analysis; for water resource managers, it enables landscape-scale drainage network analysis and basin delineation without manual GIS work.
-

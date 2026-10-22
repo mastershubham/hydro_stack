@@ -910,6 +910,47 @@ def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict)
         print(f"Exported vector: {output_path}")
     return
 
+
+def update_watershed_attributes(gs, edges, basin_centroids, basin_ids):
+    from collections import defaultdict
+
+    downstream_map = {from_id: to_id for from_id, to_id in edges}
+    upstream_map = defaultdict(list)
+    for from_id, to_id in edges:
+        upstream_map[to_id].append(from_id)
+
+    statements = []
+    for bid in map(int, basin_ids):
+        assignments = []
+        downstream_id = downstream_map.get(bid)
+        if downstream_id is not None:
+            assignments.append(f"downstream_id = {int(downstream_id)}")
+
+        upstream_ids = upstream_map.get(bid, [])
+        if upstream_ids:
+            upstream_value = ",".join(map(str, map(int, upstream_ids)))
+            assignments.append(f"upstream_ids = '{upstream_value}'")
+
+        if (downstream_id is not None
+                and bid in basin_centroids
+                and downstream_id in basin_centroids):
+            dx = basin_centroids[downstream_id][0] - basin_centroids[bid][0]
+            dy = basin_centroids[downstream_id][1] - basin_centroids[bid][1]
+            bearing = round(math.degrees(math.atan2(dx, dy)) % 360, 2)
+            assignments.append(f"flow_direction = {bearing}")
+
+        if assignments:
+            statements.append(
+                "UPDATE watersheds_vect SET "
+                + ", ".join(assignments)
+                + f" WHERE basin_id = {bid};"
+            )
+
+    if statements:
+        sql = "BEGIN TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;\n"
+        gs.write_command("db.execute", input="-", stdin=sql)
+
+
 # Main function
 def main():
     args = parse_args()
@@ -1158,33 +1199,7 @@ def main():
     gs.run_command("v.db.update", map="watersheds_vect", column="basin_id", query_column="value")
 
 
-    from collections import defaultdict
-    downstream_map = {from_id: to_id for (from_id, to_id) in edges}
-    upstream_map   = defaultdict(list)
-    for from_id, to_id in edges:
-        upstream_map[to_id].append(from_id)
-
-    
-    for bid in map(int, basin_ids):
-        # For each basin, attach the downstream basin, the sequence of upstream neighbours, and a
-        # bearing angle derived from the centroid-to-centroid direction. These are useful for
-        # hydrologic interpretation and visual exploration.
-        ds = downstream_map.get(bid)
-        us = upstream_map.get(bid, [])
-        bearing = None
-        if ds is not None and bid in basin_centroids and ds in basin_centroids:
-            dx = basin_centroids[ds][0] - basin_centroids[bid][0]
-            dy = basin_centroids[ds][1] - basin_centroids[bid][1]
-            bearing = round(math.degrees(math.atan2(dx, dy)) % 360, 2)
-        if ds is not None:
-            gs.run_command("v.db.update", map="watersheds_vect",
-                           column="downstream_id", value=str(ds), where=f"basin_id={bid}")
-        if us:
-            gs.run_command("v.db.update", map="watersheds_vect",
-                           column="upstream_ids", value=",".join(map(str, us)), where=f"basin_id={bid}")
-        if bearing is not None:
-            gs.run_command("v.db.update", map="watersheds_vect",
-                           column="flow_direction", value=str(bearing), where=f"basin_id={bid}")
+    update_watershed_attributes(gs, edges, basin_centroids, basin_ids)
     print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
 
     gs.run_command("r.mask", flags="r")

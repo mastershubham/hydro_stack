@@ -30,6 +30,7 @@ import rasterio
 import json
 import numpy as np
 import math
+from contextlib import contextmanager
 from dem_downloader import DEMDownloader
 import time
 import richdem as rd
@@ -44,6 +45,23 @@ HYPER_PARAM = 1200
 CONFIG = {
     "DEM": "srtm30"  # DEM key used by DEMDownloader; see dem_downloader.py for registry details.
 }
+
+
+@contextmanager
+def timed(stage, timings):
+    start_time = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[stage] = timings.get(stage, 0.0) + time.perf_counter() - start_time
+
+
+def format_duration(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    remaining_seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{remaining_seconds:05.2f}"
+
 
 # CLI arguments for the watershed processing pipeline. These flags control the input
 # polygon, output directory, GRASS database, and the hydrologic thresholds used to
@@ -953,279 +971,295 @@ def update_watershed_attributes(gs, edges, basin_centroids, basin_ids):
 
 # Main function
 def main():
-    args = parse_args()
+    total_start_time = time.perf_counter()
+    stage_timings = {}
+    with timed("CLI and output directory setup", stage_timings):
+        args = parse_args()
+        os.makedirs(args.output, exist_ok=True)
 
-    os.makedirs(args.output, exist_ok=True)
+    with timed("Input boundary and CRS", stage_timings):
+        # Load the watershed boundary and establish the local projected CRS used for DEM and flow calculations.
+        watershed_gdf = gpd.read_file(args.shp)
+        watershed_gdf = watershed_gdf.to_crs(epsg=4326)
 
-    # Load the watershed boundary and establish the local projected CRS used for DEM and flow calculations.
-    watershed_gdf = gpd.read_file(args.shp)
-    watershed_gdf = watershed_gdf.to_crs(epsg=4326)  
+        watershed_gdf.plot(color='white', edgecolor='gray', figsize=(15,12))
+        plt.title("Input Watershed Boundary")
+        plt.savefig(Path(args.output) / "watershed_boundary.png", dpi=300, bbox_inches='tight')
+        # plt.show()
 
-    watershed_gdf.plot(color='white', edgecolor='gray', figsize=(15,12))
-    plt.title("Input Watershed Boundary")
-    plt.savefig(Path(args.output) / "watershed_boundary.png", dpi=300, bbox_inches='tight')
-    # plt.show()
+        minx, miny, maxx, maxy = watershed_gdf.dissolve().total_bounds
+        buffer = 0.1 # Nearly 10 km buffer at regions near equator(in degrees)
+        bbox = (minx -buffer, miny -buffer, maxx +buffer, maxy +buffer)
+        epsg = get_utm_epsg_for_bbox(bbox)
+
+    with timed("DEM download and preview", stage_timings):
+        # Download a DEM that covers the buffered watershed footprint. Using the polygon bounds and a
+        # small margin avoids edge artifacts while keeping the raster manageable at the watershed scale.
+        location_of_dem = Path(args.output) / "dem_raw.tif"
+        location_of_dem = location_of_dem.resolve()
+
+        dem_downloader = DEMDownloader(
+            dem_key = CONFIG["DEM"],
+            south = bbox[1],
+            north = bbox[3],
+            west = bbox[0],
+            east = bbox[2],
+            output = location_of_dem,
+            tile_deg = 1.0,
+            max_workers = 6,
+            max_retries = 5,
+        )
+        dem_downloader.run()
+
+        fig, ax = plt.subplots(figsize=(10,8))
+
+        import rasterio
+        from rasterio.plot import show
+        rasterin = rasterio.open(location_of_dem)
+
+        dem_label = CONFIG["DEM"].upper()
+        show(rasterin, ax=ax, cmap='terrain', title=f'{dem_label}')
+        watershed_gdf.boundary.plot(color="black", ax=ax, linewidth=1.5)
+        plt.colorbar(ax.images[0], ax=ax, label='Elevation(m)')
+        plt.savefig(Path(args.output) / "dem_with_watershed.png", dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    with timed("GRASS setup and DEM preparation", stage_timings):
+        name_of_proj = Path(args.output).resolve().name
+        # Initialize GRASS in the same projected CRS as the DEM so all raster operations share a
+        # consistent spatial reference and cell geometry.
+        session = setup_grass_session(args.grassdb, epsg, name_of_proj)
+    
+        import grass.script as gs
+
+        subprocess.run([
+        "gdalwarp",
+        "-t_srs", f"EPSG:{epsg}",
+        str(location_of_dem),
+        str(Path(args.output) / f"dem_{epsg}.tif")
+        ])
+
+        input_dem = str(Path(args.output) / f"dem_{epsg}.tif")
+        output_dir = Path(args.output).resolve()
+        watershed_utm_path = Path(args.output) / "watershed_utm.shp"
+        watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
+        dem_conditioned = dem_preprocessing(
+            input_dem,
+            output_dir,
+            watershed_path=str(watershed_utm_path),
+        )
+
+        gs.run_command("r.in.gdal",
+                input=input_dem,
+                output="dem_utm",
+                overwrite=True)
+    
+        gs.run_command("r.in.gdal",
+                input=str(Path(args.output) / "dem_conditioned.tif"),
+                output="dem_conditioned",
+                overwrite=True)
     
 
-    minx, miny, maxx, maxy = watershed_gdf.dissolve().total_bounds
-    buffer = 0.1 # Nearly 10 km buffer at regions near equator(in degrees)
-    bbox = (minx -buffer, miny -buffer, maxx +buffer, maxy +buffer)
-    epsg = get_utm_epsg_for_bbox(bbox)
+        # Set the GRASS computational region to the conditioned DEM so all vector and raster tools
+        # operate on the same grid resolution and spatial extent.
+        gs.run_command("g.region", raster="dem_conditioned", flags="p")
 
-    # Download a DEM that covers the buffered watershed footprint. Using the polygon bounds and a
-    # small margin avoids edge artifacts while keeping the raster manageable at the watershed scale.
-    location_of_dem = Path(args.output) / "dem_raw.tif"
-    location_of_dem = location_of_dem.resolve()
-
-    dem_downloader = DEMDownloader(
-        dem_key = CONFIG["DEM"],
-        south = bbox[1],
-        north = bbox[3],
-        west = bbox[0],
-        east = bbox[2],
-        output = location_of_dem,
-        tile_deg = 1.0,
-        max_workers = 6,
-        max_retries = 5,
-    )
-    dem_downloader.run()
-
-    fig, ax = plt.subplots(figsize=(10,8))
-
-    import rasterio
-    from rasterio.plot import show
-    rasterin = rasterio.open(location_of_dem)
-
-    dem_label = CONFIG["DEM"].upper()
-    show(rasterin, ax=ax, cmap='terrain', title=f'{dem_label}')
-    watershed_gdf.boundary.plot(color="black", ax=ax, linewidth=1.5)
-    plt.colorbar(ax.images[0], ax=ax, label='Elevation(m)')
-    plt.savefig(Path(args.output) / "dem_with_watershed.png", dpi=300, bbox_inches='tight')
-    plt.close()
+        gs.run_command("v.in.ogr",
+                    input=str(watershed_utm_path),
+                    output="watershed",
+                    overwrite=True)
     
-    name_of_proj = Path(args.output).resolve().name
-    # Initialize GRASS in the same projected CRS as the DEM so all raster operations share a
-    # consistent spatial reference and cell geometry.
-    session = setup_grass_session(args.grassdb, epsg, name_of_proj)
+        try:
+            gs.run_command("r.mask", flags="r")
+        except:
+            pass
+        gs.run_command("r.mask",
+                vector="watershed")
+
+
     
-    import grass.script as gs
+        print("DEM imported into GRASS and region set to DEM extent.")
 
-    subprocess.run([
-    "gdalwarp",
-    "-t_srs", f"EPSG:{epsg}",
-    str(location_of_dem),
-    str(Path(args.output) / f"dem_{epsg}.tif")
-    ])
+        # Plotting the UTM DEM helps confirm the imported extent, grid alignment, and boundary mask.
+        fig, ax = plt.subplots(figsize=(10, 8))
 
-    input_dem = str(Path(args.output) / f"dem_{epsg}.tif")
-    output_dir = Path(args.output).resolve()
-    watershed_utm_path = Path(args.output) / "watershed_utm.shp"
-    watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
-    dem_conditioned = dem_preprocessing(
-        input_dem,
-        output_dir,
-        watershed_path=str(watershed_utm_path),
-    )
+        dem_path = Path(args.output) / f"dem_{epsg}.tif"
+        with rasterio.open(dem_path) as src:
+            show(src, ax=ax, cmap='terrain')
 
-    gs.run_command("r.in.gdal",
-               input=input_dem,
-               output="dem_utm",
-               overwrite=True)
+        plt.title("DEM in GRASS GIS (UTM)")
+        plt.axis('off')
+        plt.close()
+
     
-    gs.run_command("r.in.gdal",
-               input=str(Path(args.output) / "dem_conditioned.tif"),
-               output="dem_conditioned",
-               overwrite=True)
-    
+    with timed("Flow, stream, and catchment derivation", stage_timings):
+        # Compute the flow direction, flow accumulation, and initial micro-watershed partition.
+        # These rasters are the foundation for stream extraction and downstream basin merging.
+        flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
+                                                                                    hyperparam_threshold=HYPER_PARAM)
 
-    # Set the GRASS computational region to the conditioned DEM so all vector and raster tools
-    # operate on the same grid resolution and spatial extent.
-    gs.run_command("g.region", raster="dem_conditioned", flags="p")
-
-    gs.run_command("v.in.ogr",
-                   input=str(watershed_utm_path),
-                   output="watershed",
-                   overwrite=True)
-    
-    try:
+        flow_dir_st = "flow_dir_st"
         gs.run_command("r.mask", flags="r")
-    except:
-        pass
-    gs.run_command("r.mask",
-               vector="watershed")
+        # Extract the stream network from the current DEM and accumulation surface. The threshold
+        # controls how much upstream contributing area is needed before a channel is considered a stream.
+        gs.run_command("r.stream.extract",
+                elevation="dem_conditioned",
+                accumulation=flow_accumulation,
+                direction=flow_dir_st,
+                stream_raster="streams_rast",
+                stream_vector="streams_vect",
+                threshold=args.threshold,
+                overwrite=True)
 
-
-    
-    print("DEM imported into GRASS and region set to DEM extent.")
-
-    # Plotting the UTM DEM helps confirm the imported extent, grid alignment, and boundary mask.
-    fig, ax = plt.subplots(figsize=(10, 8))
-
-    dem_path = Path(args.output) / f"dem_{epsg}.tif"
-    with rasterio.open(dem_path) as src:
-        show(src, ax=ax, cmap='terrain')
-
-    plt.title("DEM in GRASS GIS (UTM)")
-    plt.axis('off')
-    plt.close()
-
-    
-    # Compute the flow direction, flow accumulation, and initial micro-watershed partition.
-    # These rasters are the foundation for stream extraction and downstream basin merging.
-    flow_accumulation, flow_dir_ws, micro_watersheds = calculate_flow_accumulation("dem_conditioned",
-                                                                                   hyperparam_threshold=HYPER_PARAM)
-
-    flow_dir_st = "flow_dir_st"
-    gs.run_command("r.mask", flags="r")
-    # Extract the stream network from the current DEM and accumulation surface. The threshold
-    # controls how much upstream contributing area is needed before a channel is considered a stream.
-    gs.run_command("r.stream.extract",
-               elevation="dem_conditioned",
-               accumulation=flow_accumulation,
-               direction=flow_dir_st,
-               stream_raster="streams_rast",
-               stream_vector="streams_vect",
-               threshold=args.threshold, 
-               overwrite=True)
-
-    # Derive stream ordering from the extracted network so each channel segment carries a
-    # Strahler/Shreve designation that can be mapped back to catchments and exported downstream.
-    gs.run_command("r.stream.order",
-               stream_rast="streams_rast",
-               direction=flow_dir_st,
-               elevation="dem_conditioned",
-               accumulation=flow_accumulation,
-               strahler="strahler_order",
-               shreve="shreve_order",
-               stream_vect="streams_with_order",
-               overwrite=True)
+        # Derive stream ordering from the extracted network so each channel segment carries a
+        # Strahler/Shreve designation that can be mapped back to catchments and exported downstream.
+        gs.run_command("r.stream.order",
+                stream_rast="streams_rast",
+                direction=flow_dir_st,
+                elevation="dem_conditioned",
+                accumulation=flow_accumulation,
+                strahler="strahler_order",
+                shreve="shreve_order",
+                stream_vect="streams_with_order",
+                overwrite=True)
   
-    catchment_order_rast = compute_catchments_with_stream_order(
-    streams_rast="streams_rast",
-    strahler_rast="strahler_order",
-    flow_dir_rast=flow_dir_st,
-    output_rast="catchment_stream_order")
+        catchment_order_rast = compute_catchments_with_stream_order(
+        streams_rast="streams_rast",
+        strahler_rast="strahler_order",
+        flow_dir_rast=flow_dir_st,
+        output_rast="catchment_stream_order")
     
-    # Reapply the watershed mask before basin merging so the merge logic operates only within
-    # the study polygon and does not join cells outside the hydrologic unit.
-    gs.run_command("r.mask", vector="watershed")
+    with timed("Watershed delineation and connectivity", stage_timings):
+        # Reapply the watershed mask before basin merging so the merge logic operates only within
+        # the study polygon and does not join cells outside the hydrologic unit.
+        gs.run_command("r.mask", vector="watershed")
   
-    micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
-                                              flow_acc_rast=flow_accumulation,
-                                              flow_dir_rast=flow_dir_ws,
-                                              epsg=epsg,
-                                              min_area_ha=args.min_watershed_size)
+        micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
+                                                  flow_acc_rast=flow_accumulation,
+                                                  flow_dir_rast=flow_dir_ws,
+                                                  epsg=epsg,
+                                                  min_area_ha=args.min_watershed_size)
 
-    # Join stream_type and type_code from streams_vect into streams_with_order
-    # Both vectors share 'cat' as the common key
-    gs.run_command(
-               "v.db.join",
+        # Join stream_type and type_code from streams_vect into streams_with_order
+        # Both vectors share 'cat' as the common key
+        gs.run_command(
+                "v.db.join",
                 map="streams_with_order",
                 column="cat",
                 other_table="streams_vect",
                 other_column="cat",
                 subset_columns="stream_type,type_code",
                 )
-    all_columns = gs.read_command(
-            "v.info", map="streams_with_order", flags="c"
-            ).strip().splitlines()
+        all_columns = gs.read_command(
+                "v.info", map="streams_with_order", flags="c"
+                ).strip().splitlines()
 
-    keep = {"cat", "stream_type", "type_code", "network", "strahler", "next_stream", "prev_str01", "prev_str02"}
+        keep = {"cat", "stream_type", "type_code", "network", "strahler", "next_stream", "prev_str01", "prev_str02"}
 
-    drop_cols = [
-    line.split("|")[1]
-    for line in all_columns
-    if "|" in line and line.split("|")[1] not in keep]
+        drop_cols = [
+        line.split("|")[1]
+        for line in all_columns
+        if "|" in line and line.split("|")[1] not in keep]
 
-    if drop_cols:
-        gs.run_command(
-            "v.db.dropcolumn",
-            map="streams_with_order",
-            columns=",".join(drop_cols)
+        if drop_cols:
+            gs.run_command(
+                "v.db.dropcolumn",
+                map="streams_with_order",
+                columns=",".join(drop_cols)
+            )
+            print(f"Dropped columns: {drop_cols}")
+
+
+        pour_points_vect, pour_points = compute_pour_points(
+            micro_watersheds_rast=micro_watersheds,
+            flow_acc_rast=flow_accumulation,
+            flow_dir_rast=flow_dir_ws,
+            output_vector="pour_points"
         )
-        print(f"Dropped columns: {drop_cols}")
 
-    
-
-    pour_points_vect, pour_points = compute_pour_points(
-        micro_watersheds_rast=micro_watersheds,
-        flow_acc_rast=flow_accumulation,
-        flow_dir_rast=flow_dir_ws,
-        output_vector="pour_points"
-    )
- 
-    catchment_area_rast = compute_catchment_area(
-        flow_acc_rast=flow_accumulation,
-        dem_rast="dem_conditioned",
-        output_rast="catchment_area_m2"
-    )
+        catchment_area_rast = compute_catchment_area(
+            flow_acc_rast=flow_accumulation,
+            dem_rast="dem_conditioned",
+            output_rast="catchment_area_m2"
+        )
 
 
-    gs.run_command("r.to.vect",
-            input=micro_watersheds,
-            output="watersheds_vect_raw",
+        gs.run_command("r.to.vect",
+                input=micro_watersheds,
+                output="watersheds_vect_raw",
+                type="area",
+                overwrite=True)
+
+        # Remove tiny sliver polygons created during raster-to-vector conversion.
+        region = gs.region()
+        cell_area_m2 = abs(float(region["ewres"]) * float(region["nsres"]))
+        sliver_area_m2 = max(cell_area_m2 * 3.0, args.min_watershed_size * 10000 * 0.05)
+        gs.run_command(
+            "v.clean",
+            input="watersheds_vect_raw",
+            output="watersheds_vect",
             type="area",
-            overwrite=True)
+            tool="rmarea",
+            threshold=str(sliver_area_m2),
+            overwrite=True,
+        )
 
-    # Remove tiny sliver polygons created during raster-to-vector conversion.
-    region = gs.region()
-    cell_area_m2 = abs(float(region["ewres"]) * float(region["nsres"]))
-    sliver_area_m2 = max(cell_area_m2 * 3.0, args.min_watershed_size * 10000 * 0.05)
-    gs.run_command(
-        "v.clean",
-        input="watersheds_vect_raw",
-        output="watersheds_vect",
-        type="area",
-        tool="rmarea",
-        threshold=str(sliver_area_m2),
-        overwrite=True,
-    )
-
-    edges, basin_centroids, basin_ids = compute_mws_connectivity(
-        micro_watersheds_rast=micro_watersheds,
-        flow_dir_rast=flow_dir_ws,
-        pour_pts=pour_points,     
-        output_geojson=Path(args.output) / "mws_connectivity.geojson"
-    )
+        edges, basin_centroids, basin_ids = compute_mws_connectivity(
+            micro_watersheds_rast=micro_watersheds,
+            flow_dir_rast=flow_dir_ws,
+            pour_pts=pour_points,
+            output_geojson=Path(args.output) / "mws_connectivity.geojson"
+        )
     
-    gs.run_command(
-        "v.db.addcolumn",
-        map="watersheds_vect",
-        columns="basin_id int, downstream_id int, upstream_ids varchar(256), flow_direction double precision")
+    with timed("Attribute updates and output export", stage_timings):
+        gs.run_command(
+            "v.db.addcolumn",
+            map="watersheds_vect",
+            columns="basin_id int, downstream_id int, upstream_ids varchar(256), flow_direction double precision")
     
-    # Each vector feature is assigned the basin ID and then enriched with the downstream and
-    # upstream relationships from the connectivity graph. This makes the vector dataset queryable
-    # and suitable for reporting or map styling.
-    gs.run_command("v.db.update", map="watersheds_vect", column="basin_id", query_column="value")
+        # Each vector feature is assigned the basin ID and then enriched with the downstream and
+        # upstream relationships from the connectivity graph. This makes the vector dataset queryable
+        # and suitable for reporting or map styling.
+        gs.run_command("v.db.update", map="watersheds_vect", column="basin_id", query_column="value")
 
 
-    update_watershed_attributes(gs, edges, basin_centroids, basin_ids)
-    print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
+        update_watershed_attributes(gs, edges, basin_centroids, basin_ids)
+        print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
 
-    gs.run_command("r.mask", flags="r")
-    rasters_to_export = {
-            "flow_direction":       (flow_dir_ws, "Float32"),
-            "flow_accumulation":    (flow_accumulation, "Float32"),
-            "stream_order":         ("strahler_order", "Int32"),
-            "catchment_area_m2":    (catchment_area_rast, "Float32"),
-            "catchment_stream_order": (catchment_order_rast, "Int32"),
-            "flow_direction_stream": (flow_dir_st, "Float32"),
-            "streams_raster":       ("streams_rast", "Int32"),
-        }
-    vectors_to_export = {
-            "streams":              ("streams_with_order", "line"),
-            "pour_points":          (pour_points_vect,  "point"),
-            "microwatersheds":      ("watersheds_vect", "area"),
-        }
-    export_outputs(args.output, rasters_to_export, vectors_to_export)
+        gs.run_command("r.mask", flags="r")
+        rasters_to_export = {
+                "flow_direction":       (flow_dir_ws, "Float32"),
+                "flow_accumulation":    (flow_accumulation, "Float32"),
+                "stream_order":         ("strahler_order", "Int32"),
+                "catchment_area_m2":    (catchment_area_rast, "Float32"),
+                "catchment_stream_order": (catchment_order_rast, "Int32"),
+                "flow_direction_stream": (flow_dir_st, "Float32"),
+                "streams_raster":       ("streams_rast", "Int32"),
+            }
+        vectors_to_export = {
+                "streams":              ("streams_with_order", "line"),
+                "pour_points":          (pour_points_vect,  "point"),
+                "microwatersheds":      ("watersheds_vect", "area"),
+            }
+        export_outputs(args.output, rasters_to_export, vectors_to_export)
 
-    if session:
-        session.close()
+    with timed("GRASS session shutdown", stage_timings):
+        if session:
+            session.close()
+
+    elapsed_time = time.perf_counter() - total_start_time
+    stage_width = max(len("Stage"), *(len(stage) for stage in stage_timings))
+    duration_width = max(
+        len("Duration"),
+        *(len(format_duration(seconds)) for seconds in stage_timings.values()),
+        len(format_duration(elapsed_time)),
+    )
+    print("\nStage timing summary")
+    print(f"{'Stage':<{stage_width}}  {'Duration':>{duration_width}}")
+    print(f"{'-' * stage_width}  {'-' * duration_width}")
+    for stage, seconds in stage_timings.items():
+        print(f"{stage:<{stage_width}}  {format_duration(seconds):>{duration_width}}")
+    print(f"{'Total':<{stage_width}}  {format_duration(elapsed_time):>{duration_width}}")
 
 if __name__ == "__main__":
-    start_time = time.perf_counter()
     main()
-
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time
-    print(f"Total execution time: {elapsed_time // 3600} hrs {(elapsed_time % 3600) // 60} mins {(elapsed_time % 60):.2f} secs")

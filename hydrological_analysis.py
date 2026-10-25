@@ -219,14 +219,25 @@ def get_utm_epsg_for_bbox(bbox: Sequence[float]) -> int:
 
     scored = []
     for info in candidates:
-        aou = info.area_of_use
         code = int(info.code)
-        if aou is None or not (32601 <= code <= 32660 or 32701 <= code <= 32760):
+        if not (32601 <= code <= 32660 or 32701 <= code <= 32760):
             continue  # skip anything that is not a WGS 84 UTM zone
 
-        area = _overlap_area(box, (aou.west, aou.south, aou.east, aou.north))
         zone = code % 100
         northern = code < 32700
+        aou = getattr(info, "area_of_use", None)
+        if aou is None:
+            west_bound = -180.0 + 6.0 * (zone - 1)
+            aou_bounds = (
+                west_bound,
+                0.0 if northern else -80.0,
+                west_bound + 6.0,
+                84.0 if northern else 0.0,
+            )
+        else:
+            aou_bounds = (aou.west, aou.south, aou.east, aou.north)
+
+        area = _overlap_area(box, aou_bounds)
         central_meridian = -183.0 + 6.0 * zone
         lon_dist = abs((lon_c - central_meridian + 180.0) % 360.0 - 180.0)
         same_hemisphere = northern == (lat_c >= 0)
@@ -938,13 +949,18 @@ def filter_vector_file_by_boundary(vector_path: Path, boundary_path: str) -> Non
     # Pyogrio raises while decoding those geometries unless invalid features are ignored.
     vectors = gpd.read_file(vector_path, on_invalid="ignore")
     boundary = gpd.read_file(boundary_path)
-    if vectors.crs is None or boundary.crs is None:
+    if vectors.crs is None and boundary.crs is None:
         raise ValueError(
-            f"Both vector output and selection boundary need a CRS: {vector_path}"
+            f"Cannot determine a CRS for vector output and selection boundary: "
+            f"{vector_path}, {boundary_path}"
         )
     if boundary.empty:
         raise ValueError(f"Selection boundary is empty: {boundary_path}")
 
+    if vectors.crs is None:
+        vectors = vectors.set_crs(boundary.crs)
+    if boundary.crs is None:
+        boundary = boundary.set_crs(vectors.crs)
     selection_geometry = boundary.to_crs(vectors.crs).geometry.union_all()
     invalid_count = int(vectors.geometry.isna().sum())
     if invalid_count:

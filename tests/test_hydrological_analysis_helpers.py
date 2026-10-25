@@ -6,7 +6,12 @@ from types import SimpleNamespace
 def test_get_utm_epsg_for_bbox_monkeypatched():
     # Monkeypatch pyproj.aoi and pyproj.database so function returns a known code.
     aoi_mod = types.SimpleNamespace(AreaOfInterest=lambda **kwargs: "AOI")
-    db_mod = types.SimpleNamespace(query_utm_crs_info=lambda **kwargs: [SimpleNamespace(code=32633)])
+    db_mod = types.SimpleNamespace(
+        query_utm_crs_info=lambda **kwargs: [
+            SimpleNamespace(code=32643),
+            SimpleNamespace(code=32644),
+        ]
+    )
     sys.modules['pyproj.aoi'] = aoi_mod
     sys.modules['pyproj.database'] = db_mod
 
@@ -15,8 +20,8 @@ def test_get_utm_epsg_for_bbox_monkeypatched():
     import hydrological_analysis as ha
     importlib.reload(ha)
 
-    epsg = ha.get_utm_epsg_for_bbox((76.0, 28.0, 80.0, 31.0))
-    assert epsg == 32633
+    epsg = ha.get_utm_epsg_for_bbox((77.0, 28.0, 80.0, 31.0))
+    assert epsg == 32644
 
 
 def test_update_watershed_attributes_batches_database_updates():
@@ -50,9 +55,12 @@ def test_update_watershed_attributes_batches_database_updates():
     assert sql.endswith("COMMIT;\n")
 
 
-def test_filter_vector_file_by_boundary_keeps_overlapping_features_whole(tmp_path):
+def test_filter_vector_file_by_boundary_keeps_overlapping_features_whole(
+    tmp_path, monkeypatch
+):
     import geopandas as gpd
     import json
+    from pathlib import Path
     from shapely.geometry import LineString, box
 
     import hydrological_analysis as ha
@@ -83,11 +91,66 @@ def test_filter_vector_file_by_boundary_keeps_overlapping_features_whole(tmp_pat
         ],
     }))
 
+    read_file = gpd.read_file
+
+    def read_without_output_crs(path, *args, **kwargs):
+        frame = read_file(path, *args, **kwargs)
+        if Path(path) == output_path:
+            return frame.set_crs(None, allow_override=True)
+        return frame
+
+    monkeypatch.setattr(gpd, "read_file", read_without_output_crs)
     ha.filter_vector_file_by_boundary(output_path, str(boundary_path))
 
+    monkeypatch.setattr(gpd, "read_file", read_file)
     clipped = gpd.read_file(output_path)
     assert clipped["stream_id"].tolist() == [1]
+    assert clipped.crs is not None
     assert clipped.geometry.iloc[0].equals(LineString([(-1, 1), (3, 1)]))
+
+
+def test_filter_vector_file_by_boundary_assigns_missing_boundary_crs(
+    tmp_path, monkeypatch
+):
+    import geopandas as gpd
+    import json
+    from pathlib import Path
+    from shapely.geometry import LineString, box
+
+    import hydrological_analysis as ha
+
+    boundary_path = tmp_path / "watershed.geojson"
+    output_path = tmp_path / "streams.geojson"
+    gpd.GeoDataFrame(geometry=[box(0, 0, 2, 2)], crs="EPSG:4326").to_file(
+        boundary_path
+    )
+    output_path.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"stream_id": 1},
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[-1, 1], [3, 1]],
+            },
+        }],
+    }))
+
+    read_file = gpd.read_file
+
+    def read_without_boundary_crs(path, *args, **kwargs):
+        frame = read_file(path, *args, **kwargs)
+        if Path(path) == boundary_path:
+            return frame.set_crs(None, allow_override=True)
+        return frame
+
+    monkeypatch.setattr(gpd, "read_file", read_without_boundary_crs)
+    ha.filter_vector_file_by_boundary(output_path, str(boundary_path))
+
+    monkeypatch.setattr(gpd, "read_file", read_file)
+    filtered = gpd.read_file(output_path)
+    assert filtered["stream_id"].tolist() == [1]
+    assert filtered.geometry.iloc[0].equals(LineString([(-1, 1), (3, 1)]))
 
 
 def test_dem_preprocessing_limits_depressions_to_watershed(tmp_path, monkeypatch):

@@ -76,6 +76,15 @@ For example, we have given a region (it is an administrative region and not a wa
 python hydrological_analysis.py --shp ./data/masalia_tehsil_boundary.shp --output masalia --grassdb ~/grassdata
 ```
 
+Hydrological calculations run within a 10 km buffer of the input boundary in the selected UTM CRS.
+Raster outputs are limited to the original watershed. Vector outputs retain complete features that
+intersect the watershed and omit features outside it. Both `watershed_utm.shp` and
+`analysis_buffer_utm.shp` are saved in the output directory.
+
+Micro-watershed connectivity is exported through the shared GeoJSON output step as
+`mws_connectivity.geojson`. It is a non-spatial FeatureCollection: each feature has a null geometry
+and directed source-to-downstream basin IDs in its properties. The `microwatersheds.geojson`
+output also includes each basin's downstream and upstream IDs.
 
 
 

@@ -12,7 +12,7 @@ Usage:
 Workflow:
     1. Select a suitable UTM CRS for the watershed footprint.
     2. Download and reproject the DEM to the local watershed extent.
-    3. Condition the DEM for hydrologic processing and limit analysis to the polygon.
+    3. Condition the DEM for hydrologic processing within a 10 km boundary buffer.
     4. Run GRASS flow-direction and flow-accumulation routines.
     5. Extract stream networks and derive stream order.
     6. Merge small micro-watersheds and export the derived raster/vector outputs.
@@ -34,10 +34,17 @@ from contextlib import contextmanager
 from dem_downloader import DEMDownloader
 import time
 import richdem as rd
+from typing import Optional
+import warnings
+from typing import Sequence
+from pyproj.aoi import AreaOfInterest
+from pyproj.database import query_utm_crs_info
+
 
 # Minimum area used when merging tiny micro-watersheds; expressed in hectares.
 MIN_WATERSHED_SIZE = 500
 MAX_MERGED_WATERSHED_SIZE_HA = 1500
+BUFFER_DISTANCE_METERS = 10_000
 # Initial r.watershed accumulation threshold in cells for preliminary basin delineation.
 # This should later be tied to DEM resolution and target watershed scale.
 HYPER_PARAM = 1200
@@ -139,74 +146,218 @@ def setup_grass_session(grassdb: str, epsg: int, project_name: str = "hydro_proj
     return None
 
 # Pick the most suitable UTM CRS for the watershed footprint from its bounding box.
-def get_utm_epsg_for_bbox(bbox):
-    west, south, east, north = bbox
-    
-    from pyproj.aoi import AreaOfInterest
-    from pyproj.database import query_utm_crs_info
-    
-    utm_info = query_utm_crs_info(
+
+def _lon_intervals(west, east):
+    """Split a longitude range into plain intervals (handles west > east)."""
+    if west <= east:
+        return [(west, east)]
+    return [(west, 180.0), (-180.0, east)]
+
+
+def _overlap_area(box, other):
+    """
+    Spherical area (unit sphere, steradians) of the intersection of two
+    lon/lat boxes given as (west, south, east, north). Either box may cross
+    the antimeridian (west > east).
+    """
+    lat_lo = max(box[1], other[1])
+    lat_hi = min(box[3], other[3])
+    if lat_hi <= lat_lo:
+        return 0.0
+
+    lon_overlap = 0.0
+    for a0, a1 in _lon_intervals(box[0], box[2]):
+        for b0, b1 in _lon_intervals(other[0], other[2]):
+            lon_overlap += max(0.0, min(a1, b1) - max(a0, b0))
+
+    return math.radians(lon_overlap) * (
+        math.sin(math.radians(lat_hi)) - math.sin(math.radians(lat_lo))
+    )
+
+
+def get_utm_epsg_for_bbox(bbox: Sequence[float]) -> int:
+    """
+    Return the WGS 84 / UTM EPSG code (int) whose zone overlaps the lon/lat
+    bounding box the most.
+
+    bbox: (west, south, east, north) in degrees. A box crossing the
+    antimeridian is given with west > east.
+
+    pyproj returns every UTM zone that intersects the box, in no useful
+    order. Each candidate is scored by the spherical area of its overlap with
+    the box; the largest wins. Ties (including zero-area boxes such as a
+    single point) go to the zone in the same hemisphere as the box centre,
+    then to the zone whose central meridian is closest to the box centre.
+
+    A warning is issued if the box touches more than one UTM zone.
+    """
+    west, south, east, north = map(float, bbox)
+
+    if not all(map(math.isfinite, (west, south, east, north))):
+        raise ValueError(f"bbox contains non-finite values: {bbox}")
+    if not (-180 <= west <= 180 and -180 <= east <= 180):
+        raise ValueError(f"Longitudes must be within [-180, 180]: {bbox}")
+    if not (-90 <= south <= north <= 90):
+        raise ValueError(f"Latitudes must satisfy -90 <= south <= north <= 90: {bbox}")
+
+    box = (west, south, east, north)
+
+    candidates = query_utm_crs_info(
         datum_name="WGS 84",
         area_of_interest=AreaOfInterest(
             west_lon_degree=west,
             south_lat_degree=south,
             east_lon_degree=east,
-            north_lat_degree=north
-        )
+            north_lat_degree=north,
+        ),
     )
 
-    if utm_info:
-        # A single UTM zone is returned for the full AOI; this is sufficient for
-        # watershed-scale work, but broader areas may need a tiled strategy.
-        return utm_info[0].code
-    else:
-        raise ValueError("No suitable UTM CRS found for the given AOI.")
+    # Centre of the box, used only for tie-breaking.
+    east_u = east + 360.0 if west > east else east
+    lon_c = ((west + east_u) / 2.0 + 180.0) % 360.0 - 180.0
+    lat_c = (south + north) / 2.0
 
-# Condition the DEM for hydrologic processing by removing sinks, recording depression depth,
-# and reducing the analysis extent to the watershed polygon when one is supplied. This creates
-# a terrain surface that is suitable for D8 flow routing and stream extraction.
-def dem_preprocessing(input_dem, output_dir, watershed_path=None):
-    from rasterio import features as rasterio_features
+    scored = []
+    for info in candidates:
+        aou = info.area_of_use
+        code = int(info.code)
+        if aou is None or not (32601 <= code <= 32660 or 32701 <= code <= 32760):
+            continue  # skip anything that is not a WGS 84 UTM zone
+
+        area = _overlap_area(box, (aou.west, aou.south, aou.east, aou.north))
+        zone = code % 100
+        northern = code < 32700
+        central_meridian = -183.0 + 6.0 * zone
+        lon_dist = abs((lon_c - central_meridian + 180.0) % 360.0 - 180.0)
+        same_hemisphere = northern == (lat_c >= 0)
+
+        # Larger overlap first; then hemisphere match; then closer meridian.
+        scored.append(((round(area, 12), same_hemisphere, -lon_dist), code, zone, area))
+
+    if not scored:
+        raise ValueError(f"No suitable UTM CRS found for bbox {bbox}.")
+
+    scored.sort(key=lambda s: s[0], reverse=True)
+    best_code = scored[0][1]
+
+    touched_zones = {zone for _, _, zone, area in scored if area > 0}
+    if len(touched_zones) > 1:
+        warnings.warn(
+            f"bbox touches {len(touched_zones)} UTM zones; EPSG:{best_code} has the "
+            "largest overlap, but distortion grows towards the box edges.",
+            stacklevel=2,
+        )
+
+    return best_code
+
+# Condition the DEM for hydrologic processing by removing sinks and recording depression depth.
+def dem_preprocessing(
+    input_dem,
+    output_dir,
+    watershed_path=None,
+    depression_boundary_path=None,
+):
+    from rasterio.mask import mask as mask_raster
+    from rasterio.features import geometry_mask
 
     conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
     depression_tif = str(Path(output_dir) / "natural_depressions.tif")
+    analysis_dem = input_dem
 
     with rasterio.open(input_dem) as src:
         nodata = src.nodata
-        transform = src.transform
         crs = src.crs
+        profile = src.profile.copy()
+        analysis_transform = src.transform
 
     if nodata is None:
         nodata = -9999.0
 
-    dem_in = rd.LoadGDAL(input_dem, no_data=float(nodata))
+    if watershed_path is not None:
+        boundary_gdf = gpd.read_file(watershed_path)
+        if boundary_gdf.empty:
+            raise ValueError(f"Analysis boundary is empty: {watershed_path}")
+        if boundary_gdf.crs is None or crs is None:
+            raise ValueError(
+                f"Analysis boundary and DEM both need a CRS: {watershed_path}"
+            )
+        boundary_gdf = boundary_gdf.to_crs(crs)
+        geometries = [
+            geom for geom in boundary_gdf.geometry if geom is not None
+        ]
+        if not geometries:
+            raise ValueError(f"Analysis boundary has no geometries: {watershed_path}")
+
+        with rasterio.open(input_dem) as src:
+            dem_data, transform = mask_raster(
+                src,
+                geometries,
+                crop=True,
+                nodata=nodata,
+                filled=True,
+            )
+            analysis_transform = transform
+            profile.update(
+                height=dem_data.shape[1],
+                width=dem_data.shape[2],
+                transform=transform,
+                nodata=nodata,
+            )
+        analysis_dem = str(Path(output_dir) / "dem_analysis_buffer.tif")
+        with rasterio.open(analysis_dem, "w", **profile) as dst:
+            dst.write(dem_data)
+
+    dem_in = rd.LoadGDAL(analysis_dem, no_data=float(nodata))
     print(dem_in)
 
     filled_dem = rd.FillDepressions(dem_in, in_place=False)
 
     dem_arr = np.asarray(dem_in)
     filled_arr = np.asarray(filled_dem)
-    depth = filled_arr - dem_arr # The depressions (natural and artificial) will appear as positive values. Inverted-depth map.
-
-    # Restrict downstream calculations and exports to the watershed polygon when provided.
-    watershed_mask = np.ones(dem_arr.shape, dtype=bool)
-    if watershed_path is not None:
-        watershed_gdf = gpd.read_file(watershed_path)
-        if not watershed_gdf.empty:
-            if watershed_gdf.crs is not None and crs is not None:
-                watershed_gdf = watershed_gdf.to_crs(crs)
-            watershed_mask = rasterio_features.geometry_mask(
-                [geom for geom in watershed_gdf.geometry if geom is not None],
-                out_shape=dem_arr.shape,
-                transform=transform,
-                invert=True,
-                all_touched=False,
-            )
-
     nodata_mask = dem_arr == dem_in.no_data
-    valid_mask = (~nodata_mask) & watershed_mask
-    depth[~valid_mask] = dem_in.no_data
-    depth[valid_mask] = np.clip(depth[valid_mask], 0, None)
+    valid_mask = ~nodata_mask
+
+    depression_boundary_path = (
+        depression_boundary_path
+        if depression_boundary_path is not None
+        else watershed_path
+    )
+    depth_mask = valid_mask
+    if depression_boundary_path is not None:
+        depression_boundary_gdf = gpd.read_file(depression_boundary_path)
+        if depression_boundary_gdf.empty:
+            raise ValueError(
+                f"Depression boundary is empty: {depression_boundary_path}"
+            )
+        if depression_boundary_gdf.crs is None or crs is None:
+            raise ValueError(
+                "Depression boundary and DEM both need a CRS: "
+                f"{depression_boundary_path}"
+            )
+        depression_boundary_gdf = depression_boundary_gdf.to_crs(crs)
+        depression_geometries = [
+            geom for geom in depression_boundary_gdf.geometry if geom is not None
+        ]
+        if not depression_geometries:
+            raise ValueError(
+                "Depression boundary has no geometries: "
+                f"{depression_boundary_path}"
+            )
+        inside_watershed = geometry_mask(
+            depression_geometries,
+            out_shape=dem_arr.shape,
+            transform=analysis_transform,
+            invert=True,
+        )
+        depth_mask = valid_mask & inside_watershed
+
+    depth = np.full(dem_arr.shape, dem_in.no_data, dtype=filled_arr.dtype)
+    depth[depth_mask] = np.clip(
+        filled_arr[depth_mask] - dem_arr[depth_mask],
+        0,
+        None,
+    )
+    filled_dem[~valid_mask] = dem_in.no_data
 
     depth_rd = rd.rdarray(depth, no_data=dem_in.no_data)
     depth_rd.geotransform = dem_in.geotransform
@@ -233,341 +384,237 @@ def calculate_flow_accumulation(dem_filled, hyperparam_threshold):
 
     return "flow_acc", "flow_dir_watershed", "micro_watersheds"
 
+
 def merge_small_watersheds(
     micro_watersheds_rast: str,
     flow_acc_rast: str,
     flow_dir_rast: str,
     min_area_ha: float,
-    epsg: int,
+    epsg: Optional[int] = None,          # kept for API compatibility; no longer needed
     output_rast: str = "micro_watersheds",
+    max_area_ha: Optional[float] = None,
 ) -> str:
     """
-    Merge tiny micro-watersheds upward until each basin reaches the minimum area.
+    Merge tiny micro-watersheds until each basin reaches the minimum area.
 
-    The merge logic follows the original hydrologic pattern: a small basin is
-    absorbed into its downstream neighbour when possible, otherwise into the
-    largest upstream neighbour that still exists in the current topology.
+    A small basin is absorbed into its downstream neighbour when possible,
+    otherwise into its largest upstream neighbour. If the preferred target
+    would exceed the maximum size, the remaining neighbours are tried in turn.
+
+    max_area_ha: maximum merged basin size. If None, the module-level constant
+    MAX_MERGED_WATERSHED_SIZE_HA is used when defined, otherwise no limit.
     """
     import numpy as np
     import grass.script as gs
     from grass.script import array as garray
 
-    # D8 flow-direction offsets (GRASS r.watershed encoding)
+    NODATA = -9999
+
+    # D8 offsets (GRASS r.watershed encoding): direction -> (d_row, d_col)
     DIR_OFFSETS = {
-        1: (-1, +1),   # NE
-        2: (-1,  0),   # N
-        3: (-1, -1),   # NW
-        4: ( 0, -1),   # W
-        5: (+1, -1),   # SW
-        6: (+1,  0),   # S
-        7: (+1, +1),   # SE
-        8: ( 0, +1),   # E
+        1: (-1, +1), 2: (-1, 0), 3: (-1, -1), 4: (0, -1),
+        5: (+1, -1), 6: (+1, 0), 7: (+1, +1), 8: (0, +1),
     }
 
-    # Pull the current GRASS region geometry and cell size to convert raster area to hectares.
-    region    = gs.region()
-    nrows     = int(region["rows"])
-    ncols     = int(region["cols"])
-    cell_ha   = abs(region["nsres"]) * abs(region["ewres"]) / 10_000.0
+    # setup
+    if gs.locn_is_latlong():
+        raise ValueError(
+            "Location uses a geographic CRS (degrees); cell areas in hectares "
+            "would be wrong. Use a projected location."
+        )
+
+    if max_area_ha is None:
+        max_area_ha = globals().get("MAX_MERGED_WATERSHED_SIZE_HA", float("inf"))
+
+    region = gs.region()
+    nrows, ncols = int(region["rows"]), int(region["cols"])
+    cell_ha = abs(float(region["nsres"])) * abs(float(region["ewres"])) / 10_000.0
     min_cells = min_area_ha / cell_ha
-    max_cells = MAX_MERGED_WATERSHED_SIZE_HA / cell_ha
+    max_cells = max_area_ha / cell_ha
 
     print(
-        f"[merge_small_watersheds] cell = {cell_ha:.4f} ha  "
-        f": min_cells = {min_cells:.1f}, "
-        f"max_target_cells = {max_cells:.1f}"
+        f"[merge_small_watersheds] cell = {cell_ha:.4f} ha, "
+        f"min_cells = {min_cells:.1f}, max_cells = {max_cells:.1f}"
     )
 
-    # Load the generated micro-watershed raster and the supporting drainage rasters.
     gs.run_command(
         "r.mapcalc",
         expr=f"_mws_work = int({micro_watersheds_rast})",
         overwrite=True,
     )
-    basin_arr   = garray.array("_mws_work",   null=-9999).astype(np.int32)
-    acc_arr     = garray.array(flow_acc_rast, null=-1  ).astype(np.float32)
-    flowdir_arr = garray.array(flow_dir_rast, null=0   ).astype(np.int8)
+    try:
+        basin_arr = garray.array("_mws_work", null=NODATA).astype(np.int32)
+        acc_arr = garray.array(flow_acc_rast, null=0).astype(np.float32)
+        flowdir_arr = garray.array(flow_dir_rast, null=0).astype(np.int8)
+    finally:
+        gs.run_command("g.remove", type="raster", name="_mws_work", flags="f")
 
-    # Pre-build the D8 offset look-up table once; reused every iteration.
-    _offset_lut = np.zeros((9, 2), dtype=np.int32)   # index 0 → no-op
-    for _d, (_dr, _dc) in DIR_OFFSETS.items():
-        _offset_lut[_d] = (_dr, _dc)
+    # static drainage geometry (once)
+    # Negative r.watershed directions mean "drains out of the region"; the
+    # magnitude still encodes the direction. Accumulation can also be negative.
+    d_raw = flowdir_arr.astype(np.int32)
+    d_abs = np.abs(d_raw)
+    has_dir = (d_abs >= 1) & (d_abs <= 8)
+    leaves_region = d_raw < 0
+    d_clip = np.where(has_dir, d_abs, 0)
 
-    # Build the drainage topology in a vectorized way so the merge pass can process
-    # many basins without the original basin-by-basin loop. The resulting dictionaries
-    # describe each basin's outlet, area, and upstream neighbours, which are the pieces
-    # needed to decide how to absorb tiny basins without breaking the D8 drainage graph.
-    def _build_maps_vectorized(basin_arr):
-        """
-        Fully vectorized replacement for the original _build_maps().
+    offset_lut = np.zeros((9, 2), dtype=np.int32)
+    for d, (dr, dc) in DIR_OFFSETS.items():
+        offset_lut[d] = (dr, dc)
 
-        Returns identical structures:
-            downstream : dict  basin_id -> downstream_basin_id | None
-            area_cells : dict  basin_id -> cell count
-            upstream   : dict  basin_id -> list[basin_id]
+    R, C = np.indices((nrows, ncols), dtype=np.int32)
+    nr = R + offset_lut[d_clip, 0]
+    nc = C + offset_lut[d_clip, 1]
+    in_bounds = (nr >= 0) & (nr < nrows) & (nc >= 0) & (nc < ncols)
+    safe_r = np.clip(nr, 0, nrows - 1)
+    safe_c = np.clip(nc, 0, ncols - 1)
+    can_read_nbr = has_dir & in_bounds
+    acc_abs = np.abs(acc_arr)
 
-        Key properties preserved
-        ────────────────────────
-        • Pour point = boundary cell with MAXIMUM flow accumulation whose
-          D8 neighbour lies in a different basin (or off-grid).  Identical
-          semantics to the original per-cell loop.
-        • Off-grid flows are correctly identified as outlets (downstream=None)
-          without reading clamped neighbour values (fix for OOB heuristic).
-        • area_cells uses np.bincount → O(n) instead of O(n*b).
-        """
-        valid_mask = (basin_arr > 0) & (basin_arr != -9999)
+    def dedupe(seq):
+        return list(dict.fromkeys(seq))
 
-        # Count the cells in each basin using np.bincount. This is faster and more stable than
-        # repeatedly summing each basin's footprint, and it gives the area information required
-        # for the minimum-size merge threshold.
-        flat_valid = basin_arr[valid_mask]
-        if flat_valid.size == 0:
+    # topology builder
+    def build_maps(basins):
+        """Return (downstream, area_cells, upstream) dicts for the current labels."""
+        valid = basins > 0
+        flat = basins[valid]
+        if flat.size == 0:
             return {}, {}, {}
-        counts     = np.bincount(flat_valid)
-        valid_ids  = np.flatnonzero(counts).astype(np.int32)
-        area_cells = {int(i): int(counts[i]) for i in valid_ids}
 
-        # Map each D8 flow-direction cell to the neighbour it drains toward. The offset table is
-        # used to compute the candidate downstream cell for every valid raster cell in one pass.
-        R, C  = np.indices((nrows, ncols), dtype=np.int32)
-        d_raw = flowdir_arr.astype(np.int32)
-        d_clip = np.where((d_raw >= 1) & (d_raw <= 8), d_raw, 0)
+        counts = np.bincount(flat)
+        ids = np.flatnonzero(counts)
+        area = {int(i): int(counts[i]) for i in ids}
+        downstream = {int(i): None for i in ids}
+        upstream = {int(i): [] for i in ids}
 
-        nr = R + _offset_lut[d_clip, 0]
-        nc = C + _offset_lut[d_clip, 1]
+        # Neighbour label, read only where the neighbour is on the grid.
+        nbr = np.full(basins.shape, NODATA, dtype=np.int32)
+        nbr[can_read_nbr] = basins[safe_r[can_read_nbr], safe_c[can_read_nbr]]
 
-        has_valid_dir = (d_raw >= 1) & (d_raw <= 8)
-        in_bounds     = (nr >= 0) & (nr < nrows) & (nc >= 0) & (nc < ncols)
-        is_basin      = valid_mask
+        src = valid & has_dir
+        # Outlet: drains off the grid, out of the region, or into a null cell.
+        outlet = src & (~in_bounds | leaves_region | (nbr <= 0))
+        # Cross-basin: drains into a different valid basin.
+        cross = src & ~outlet & (nbr != basins)
+        cand = outlet | cross
 
-        # ── neighbour basin (only read where safe) ─────────────────────────
-        # Critically: never read nbr_basin for out-of-bounds cells, so outlet
-        # cells are not accidentally matched to a clamped neighbour's basin ID.
-        safe_r = np.clip(nr, 0, nrows - 1)
-        safe_c = np.clip(nc, 0, ncols - 1)
-
-        nbr_basin = np.full((nrows, ncols), -9999, dtype=np.int32)
-        ib_basin  = is_basin & has_valid_dir & in_bounds
-        nbr_basin[ib_basin] = basin_arr[safe_r[ib_basin], safe_c[ib_basin]]
-
-        # A cell is considered a candidate outlet when it drains outside the grid or into a
-        # different basin. These are the natural pour points used to identify each basin's link
-        # to the downstream network.
-        is_outlet_cell = is_basin & has_valid_dir & (~in_bounds)
-        is_cross_basin = (
-            is_basin & has_valid_dir & in_bounds
-            & (nbr_basin != basin_arr)
-            & (nbr_basin > 0)
-            & (nbr_basin != -9999)
-        )
-        candidate = is_outlet_cell | is_cross_basin
-
-        cr, cc      = np.where(candidate)
+        cr, cc = np.nonzero(cand)
         if cr.size == 0:
-            downstream = {int(i): None for i in valid_ids}
-            upstream   = {int(i): []   for i in valid_ids}
-            return downstream, area_cells, upstream
+            return downstream, area, upstream
 
-        cand_bid    = basin_arr[cr, cc]
-        # Use -1 as a sentinel for "drains off grid" (outlet)
-        cand_target = np.where(
-            is_outlet_cell[cr, cc],
-            np.int32(-1),
-            nbr_basin[cr, cc],
-        )
-        cand_acc = acc_arr[cr, cc]
+        cand_bid = basins[cr, cc]
+        cand_tgt = np.where(outlet[cr, cc], -1, nbr[cr, cc])
+        cand_acc = acc_abs[cr, cc]
 
-        # Choose the single strongest outlet per basin by sorting each candidate outlet in
-        # descending accumulation. The first occurrence per basin_id therefore corresponds to the
-        # dominant pour point, which is the correct outlet for connectivity and merge decisions.
-        order     = np.lexsort((-cand_acc, cand_bid))
-        bid_s     = cand_bid[order]
-        tgt_s     = cand_target[order]
+        # Per basin, keep the candidate with the highest accumulation.
+        order = np.lexsort((-cand_acc, cand_bid))
+        bid_s, tgt_s = cand_bid[order], cand_tgt[order]
+        first = np.ones(bid_s.size, dtype=bool)
+        first[1:] = bid_s[1:] != bid_s[:-1]
 
-        first         = np.empty(len(bid_s), dtype=bool)
-        first[0]      = True
-        first[1:]     = bid_s[1:] != bid_s[:-1]
+        for b, t in zip(bid_s[first].tolist(), tgt_s[first].tolist()):
+            downstream[b] = None if t == -1 else t
 
-        # ── downstream dict ────────────────────────────────────────────────
-        downstream = {int(i): None for i in valid_ids}
-        for bid, tgt in zip(bid_s[first].tolist(), tgt_s[first].tolist()):
-            downstream[int(bid)] = None if tgt == -1 else int(tgt)
+        for s, t in downstream.items():
+            if t is not None:
+                upstream[t].append(s)
+        return downstream, area, upstream
 
-        # ── upstream dict (invert downstream) ─────────────────────────────
-        upstream = {int(i): [] for i in valid_ids}
-        for src, tgt in downstream.items():
-            if tgt is not None:
-                upstream.setdefault(tgt, []).append(src)
-
-        return downstream, area_cells, upstream
-
-    # Repeat until all remaining basins satisfy the minimum area threshold or cannot be merged
-    # without violating the drainage topology. This is the iterative cleanup step that turns the
-    # initial fine-grained basin partition into a more hydrologically appropriate watershed map.
-    iteration    = 0
+    # merge passes
     total_merged = 0
+    passes = 0
 
     while True:
-        # Fix 2: reset unmergeable every iteration so basins that gain a
-        # neighbour due to an earlier merge are not permanently skipped.
-        unmergeable = set()
+        downstream, area, upstream = build_maps(basin_arr)
 
-        downstream, area_cells, upstream = _build_maps_vectorized(basin_arr)
-
-        small_basins = sorted(
-            (area, bid)
-            for bid, area in area_cells.items()
-            if area < min_cells
-        )   # ascending by area: smallest first
-
-        if not small_basins:
-            print(
-                f"[merge_small_watersheds] Done after {iteration} iteration(s), "
-                f"{total_merged} merges total.  "
-                f"All {len(area_cells)} basins >= {min_area_ha} ha."
-            )
+        small = sorted((a, b) for b, a in area.items() if a < min_cells)
+        if not small:
             break
 
-        merges_this_pass = 0
+        parent = {}      # absorbed basin -> the basin it was merged into
 
-        for _area, bid in small_basins:
-            # May have been absorbed earlier in this pass
-            if bid not in area_cells:
+        for _, bid in small:
+            if bid not in area:                  # absorbed earlier in this pass
                 continue
-            # Re-check against the live array (original approach)
-            current_area = area_cells[bid]
-            if current_area >= min_cells:
+            cur = area[bid]
+            if cur >= min_cells:                 # grew by absorbing others
                 continue
 
-            # ── Choose merge target (unchanged from original) ──────────────
+            # Candidate targets: downstream first, then upstream by size.
+            cands = []
             ds = downstream.get(bid)
-            if ds is not None and ds in area_cells:
-                target = ds
-            else:
-                us_ids = [u for u in upstream.get(bid, []) if u in area_cells]
-                if not us_ids:
-                    unmergeable.add(bid)
-                    print(
-                        f"[merge_small_watersheds] NOTE: basin {bid} has no "
-                        f"valid neighbours – skipping."
+            if ds is not None and ds in area:
+                cands.append(ds)
+            ups = [u for u in upstream.get(bid, []) if u in area]
+            cands.extend(sorted(ups, key=lambda u: -area[u]))
+
+            target = next((c for c in cands if area[c] + cur <= max_cells), None)
+            if target is None:
+                continue                         # no neighbour, or none fits
+
+            # merge bid into target and patch the topology locally
+            bid_ds = downstream.pop(bid, None)
+            bid_us = upstream.pop(bid, [])
+
+            for u in bid_us:                     # children now drain into target
+                if u != target:
+                    downstream[u] = target
+
+            ups_t = upstream.setdefault(target, [])
+            if bid_ds != target:
+                # target was upstream of bid: it inherits bid's outlet
+                downstream[target] = bid_ds
+                if bid_ds is not None and bid_ds in upstream:
+                    upstream[bid_ds] = dedupe(
+                        target if x == bid else x for x in upstream[bid_ds]
                     )
-                    continue
-                target = max(us_ids, key=lambda u: area_cells[u])
-
-            merged_area = area_cells[target] + current_area
-            if merged_area > max_cells:
-                unmergeable.add(bid)
-                print(
-                    f"[merge_small_watersheds] NOTE: merging basin {bid} into "
-                    f"{target} would exceed the {MAX_MERGED_WATERSHED_SIZE_HA} "
-                    "ha target limit – skipping."
-                )
-                continue
-
-            # ── Apply merge: relabel bid → target in the array ────────────
-            # This is the ORIGINAL mechanism. No Union-Find. Merge direction
-            # is unambiguous: bid cells become target cells.
-            basin_arr[basin_arr == bid] = target
-            area_cells[target] = (
-                area_cells.get(target, 0) + area_cells.pop(bid, 0)
+            upstream[target] = dedupe(
+                u for u in ups_t + bid_us if u != target and u != bid
             )
 
-            # Patch connectivity for remaining basins in this same pass.
-            for other, other_ds in list(downstream.items()):
-                if other_ds == bid:
-                    downstream[other] = target
-            for other_ups in upstream.values():
-                for i, u in enumerate(other_ups):
-                    if u == bid:
-                        other_ups[i] = target
+            area[target] += area.pop(bid)
+            parent[bid] = target
+            total_merged += 1
 
-            # Move bid's upstream children under target.
-            absorbed_us = upstream.pop(bid, [])
-            target_ups  = upstream.setdefault(target, [])
-            target_ups.extend(u for u in absorbed_us if u != target)
-            # Fix 3: deduplicate upstream list to avoid repeated IDs.
-            upstream[target] = list(dict.fromkeys(
-                u for u in target_ups if u != target
-            ))
-
-            downstream.pop(bid, None)
-
-            merges_this_pass += 1
-            total_merged      += 1
-
-        iteration += 1
-
-        if merges_this_pass == 0:
-            remaining_small = sum(
-                1 for bid, area in area_cells.items()
-                if area < min_cells and bid not in unmergeable
-            )
-            if remaining_small:
-                print(
-                    f"[merge_small_watersheds] NOTE: {remaining_small} basin(s) "
-                    f"remain below {min_area_ha} ha but have no valid merge "
-                    f"candidate – kept as-is."
-                )
+        passes += 1
+        if not parent:
             break
 
-    # Renumber the final basin IDs to a compact, sequential set for downstream GRASS processing.
-    # A compact ID set is simpler to handle in the later raster/vector conversion and makes the
-    # basin graph easier to inspect and attribute in GRASS tables.
-    final_ids = np.unique(basin_arr)
-    final_ids = final_ids[(final_ids > 0) & (final_ids != -9999)]
-    new_id = 1
-    for old_id in sorted(final_ids.tolist()):
-        basin_arr[basin_arr == old_id] = -(new_id)
-        new_id += 1
-    basin_arr = -basin_arr
-    basin_arr[basin_arr == 9999] = -9999
+        # Apply all relabelling of this pass in one lookup-table step.
+        def find(x):
+            while x in parent:
+                x = parent[x]
+            return x
 
-    # Write the merged basin raster back into GRASS so the rest of the pipeline can work
-    # with a clean, compact watershed partition instead of the original fine-grained micro-basins.
-    import tempfile, os
-    import rasterio
-    from rasterio.transform import from_bounds
+        lut = np.arange(int(basin_arr.max()) + 1, dtype=np.int32)
+        for b in parent:
+            lut[b] = find(b)
+        pos = basin_arr > 0
+        basin_arr[pos] = lut[basin_arr[pos]]
 
-    region    = gs.region()
-    transform = from_bounds(
-        region["w"], region["s"], region["e"], region["n"],
-        ncols, nrows,
-    )
+    remaining = sum(1 for a in area.values() if a < min_cells)
+    msg = f"{total_merged} merges in {passes} pass(es)"
+    if remaining:
+        msg += f"; {remaining} basin(s) stay below {min_area_ha} ha (no valid merge)"
+    print(f"[merge_small_watersheds] {msg}")
 
-    tmp_tif = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
-    tmp_tif.close()
+    # compact renumbering 1..K
+    pos = basin_arr > 0
+    final = np.full(basin_arr.shape, NODATA, dtype=np.int32)
+    ids, inverse = np.unique(basin_arr[pos], return_inverse=True)
+    final[pos] = inverse.astype(np.int32) + 1
 
-    mask      = (basin_arr > 0) & (basin_arr != -9999)
-    write_arr = basin_arr.astype(np.int32)
-    write_arr[~mask] = -2147483648
+    # write back to GRASS
+    # Written through the GRASS array interface: same region, same CRS, no
+    # temporary GeoTIFF and no CRS mismatch on import.
+    out = garray.array(dtype=np.int32)
+    out[:, :] = final
+    out.write(output_rast, overwrite=True, null=NODATA)
 
-    crs = f"EPSG:{epsg}" if epsg else None
-    with rasterio.open(
-        tmp_tif.name, "w",
-        driver="GTiff",
-        height=nrows, width=ncols,
-        count=1, dtype="int32",
-        crs=crs,
-        transform=transform,
-        nodata=-2147483648,
-    ) as dst:
-        dst.write(write_arr, 1)
-
-    gs.run_command(
-        "r.in.gdal",
-        input=tmp_tif.name,
-        output=output_rast,
-        overwrite=True,
-    )
-    os.unlink(tmp_tif.name)
-    gs.run_command("g.remove", type="raster", name="_mws_work", flags="f")
-
-    final_count = len(np.unique(
-        basin_arr[(basin_arr > 0) & (basin_arr != 9999)]
-    ))
     print(
         f"[merge_small_watersheds] '{output_rast}' written "
-        f"({final_count} basins finally)."
+        f"({ids.size} basins finally)."
     )
     return output_rast
 
@@ -718,8 +765,7 @@ def compute_catchment_area(flow_acc_rast: str,
  
 def compute_mws_connectivity(micro_watersheds_rast: str,
                              flow_dir_rast: str,
-                             pour_pts: dict,
-                             output_geojson: Path) -> tuple:
+                             pour_pts: dict) -> tuple:
     import grass.script as gs
     from grass.script import array as garray
 
@@ -791,30 +837,26 @@ def compute_mws_connectivity(micro_watersheds_rast: str,
         if downstream_basin != bid:
             edges[(bid, downstream_basin)] = True
 
-    features = []
-    for (from_id, to_id) in edges:
-        if from_id not in basin_centroids or to_id not in basin_centroids:
-            continue
-        x0, y0 = basin_centroids[from_id]
-        x1, y1 = basin_centroids[to_id]
-        features.append({
-            "type": "Feature",
-            "geometry": {
-                "type": "LineString",
-                "coordinates": [[x0, y0], [x1, y1]]
-            },
-            "properties": {
-                "from_basin_id": from_id,
-                "to_basin_id":   to_id
-            }
-        })
-
-    geojson = {"type": "FeatureCollection", "features": features}
-    with open(output_geojson, "w") as f:
-        json.dump(geojson, f, indent=2)
-
-    print(f"MWS connectivity: {len(features)} directed edges -> {output_geojson}")
+    print(f"MWS connectivity: {len(edges)} directed basin relationships")
     return edges, basin_centroids, basin_ids
+
+
+def mws_connectivity_geojson(edges: dict) -> dict:
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": None,
+                "properties": {
+                    "from_basin_id": from_id,
+                    "to_basin_id": to_id,
+                },
+            }
+            for from_id, to_id in edges
+        ],
+    }
+
 
 def compute_catchments_with_stream_order(
     streams_rast: str,
@@ -889,7 +931,39 @@ def compute_catchments_with_stream_order(
     print(f"'{output_rast}' ready: each cell = Strahler order of its draining segment.")
     return output_rast
 
-def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict):
+def filter_vector_file_by_boundary(vector_path: Path, boundary_path: str) -> None:
+    import geopandas as gpd
+
+    # GRASS can export zero-length stream segments as one-coordinate LineStrings.
+    # Pyogrio raises while decoding those geometries unless invalid features are ignored.
+    vectors = gpd.read_file(vector_path, on_invalid="ignore")
+    boundary = gpd.read_file(boundary_path)
+    if vectors.crs is None or boundary.crs is None:
+        raise ValueError(
+            f"Both vector output and selection boundary need a CRS: {vector_path}"
+        )
+    if boundary.empty:
+        raise ValueError(f"Selection boundary is empty: {boundary_path}")
+
+    selection_geometry = boundary.to_crs(vectors.crs).geometry.union_all()
+    invalid_count = int(vectors.geometry.isna().sum())
+    if invalid_count:
+        print(
+            f"Warning: dropping {invalid_count} invalid vector geometries "
+            f"from {vector_path}"
+        )
+    vectors = vectors[vectors.geometry.notna()].copy()
+    vectors = vectors[vectors.geometry.intersects(selection_geometry)]
+    vectors.to_file(vector_path, driver="GeoJSON")
+
+
+def export_outputs(
+    output_dir,
+    rasters_to_export: dict,
+    vectors_to_export: dict,
+    clip_boundary_path: str | None = None,
+    geojsons_to_export: dict | None = None,
+):
     import grass.script as gs
 
     # Export the derived products to GeoTIFF and GeoJSON so the final hydrologic outputs can be
@@ -925,7 +999,15 @@ def export_outputs(output_dir, rasters_to_export: dict, vectors_to_export: dict)
                    format="GeoJSON",
                    type=geom_type,
                    overwrite=True)
+        if clip_boundary_path is not None:
+            filter_vector_file_by_boundary(output_path, clip_boundary_path)
         print(f"Exported vector: {output_path}")
+
+    for name, geojson in (geojsons_to_export or {}).items():
+        output_path = Path(output_dir) / f"{name}.geojson"
+        with open(output_path, "w") as f:
+            json.dump(geojson, f, indent=2)
+        print(f"Exported GeoJSON attributes: {output_path}")
     return
 
 
@@ -987,14 +1069,21 @@ def main():
         plt.savefig(Path(args.output) / "watershed_boundary.png", dpi=300, bbox_inches='tight')
         # plt.show()
 
-        minx, miny, maxx, maxy = watershed_gdf.dissolve().total_bounds
-        buffer = 0.1 # Nearly 10 km buffer at regions near equator(in degrees)
-        bbox = (minx -buffer, miny -buffer, maxx +buffer, maxy +buffer)
+        bbox = tuple(watershed_gdf.dissolve().total_bounds)
         epsg = get_utm_epsg_for_bbox(bbox)
+        watershed_utm = watershed_gdf.to_crs(epsg=epsg).dissolve()
+        watershed_utm_path = Path(args.output) / "watershed_utm.shp"
+        watershed_utm.to_file(watershed_utm_path)
+        analysis_buffer = watershed_utm.copy()
+        analysis_buffer.geometry = analysis_buffer.geometry.buffer(
+            BUFFER_DISTANCE_METERS
+        )
+        analysis_buffer_utm_path = Path(args.output) / "analysis_buffer_utm.shp"
+        analysis_buffer.to_file(analysis_buffer_utm_path)
+        bbox = tuple(analysis_buffer.to_crs(epsg=4326).total_bounds)
 
     with timed("DEM download and preview", stage_timings):
-        # Download a DEM that covers the buffered watershed footprint. Using the polygon bounds and a
-        # small margin avoids edge artifacts while keeping the raster manageable at the watershed scale.
+        # Download a DEM covering the buffered watershed footprint.
         location_of_dem = Path(args.output) / "dem_raw.tif"
         location_of_dem = location_of_dem.resolve()
 
@@ -1041,12 +1130,11 @@ def main():
 
         input_dem = str(Path(args.output) / f"dem_{epsg}.tif")
         output_dir = Path(args.output).resolve()
-        watershed_utm_path = Path(args.output) / "watershed_utm.shp"
-        watershed_gdf.to_crs(epsg=epsg).to_file(watershed_utm_path)
         dem_conditioned = dem_preprocessing(
             input_dem,
             output_dir,
-            watershed_path=str(watershed_utm_path),
+            watershed_path=str(analysis_buffer_utm_path),
+            depression_boundary_path=str(watershed_utm_path),
         )
 
         gs.run_command("r.in.gdal",
@@ -1060,25 +1148,35 @@ def main():
                 overwrite=True)
     
 
-        # Set the GRASS computational region to the conditioned DEM so all vector and raster tools
-        # operate on the same grid resolution and spatial extent.
-        gs.run_command("g.region", raster="dem_conditioned", flags="p")
-
         gs.run_command("v.in.ogr",
-                    input=str(watershed_utm_path),
-                    output="watershed",
+                    input=str(analysis_buffer_utm_path),
+                    output="analysis_buffer",
                     overwrite=True)
+        gs.run_command(
+            "v.in.ogr",
+            input=str(watershed_utm_path),
+            output="watershed",
+            overwrite=True,
+        )
+
+        # Align the computational region to the buffered polygon and conditioned DEM grid.
+        gs.run_command(
+            "g.region",
+            vector="analysis_buffer",
+            align="dem_conditioned",
+            flags="a",
+        )
     
         try:
             gs.run_command("r.mask", flags="r")
         except:
             pass
         gs.run_command("r.mask",
-                vector="watershed")
+                vector="analysis_buffer")
 
 
     
-        print("DEM imported into GRASS and region set to DEM extent.")
+        print("DEM imported into GRASS and region set to the buffered analysis area.")
 
         # Plotting the UTM DEM helps confirm the imported extent, grid alignment, and boundary mask.
         fig, ax = plt.subplots(figsize=(10, 8))
@@ -1099,7 +1197,6 @@ def main():
                                                                                     hyperparam_threshold=HYPER_PARAM)
 
         flow_dir_st = "flow_dir_st"
-        gs.run_command("r.mask", flags="r")
         # Extract the stream network from the current DEM and accumulation surface. The threshold
         # controls how much upstream contributing area is needed before a channel is considered a stream.
         gs.run_command("r.stream.extract",
@@ -1130,10 +1227,6 @@ def main():
         output_rast="catchment_stream_order")
     
     with timed("Watershed delineation and connectivity", stage_timings):
-        # Reapply the watershed mask before basin merging so the merge logic operates only within
-        # the study polygon and does not join cells outside the hydrologic unit.
-        gs.run_command("r.mask", vector="watershed")
-  
         micro_watersheds = merge_small_watersheds(micro_watersheds_rast=micro_watersheds,
                                                   flow_acc_rast=flow_accumulation,
                                                   flow_dir_rast=flow_dir_ws,
@@ -1208,8 +1301,8 @@ def main():
             micro_watersheds_rast=micro_watersheds,
             flow_dir_rast=flow_dir_ws,
             pour_pts=pour_points,
-            output_geojson=Path(args.output) / "mws_connectivity.geojson"
         )
+        connectivity_geojson = mws_connectivity_geojson(edges)
     
     with timed("Attribute updates and output export", stage_timings):
         gs.run_command(
@@ -1227,6 +1320,13 @@ def main():
         print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
 
         gs.run_command("r.mask", flags="r")
+        gs.run_command(
+            "g.region",
+            vector="watershed",
+            align="dem_conditioned",
+            flags="a",
+        )
+        gs.run_command("r.mask", vector="watershed")
         rasters_to_export = {
                 "flow_direction":       (flow_dir_ws, "Float32"),
                 "flow_accumulation":    (flow_accumulation, "Float32"),
@@ -1241,7 +1341,13 @@ def main():
                 "pour_points":          (pour_points_vect,  "point"),
                 "microwatersheds":      ("watersheds_vect", "area"),
             }
-        export_outputs(args.output, rasters_to_export, vectors_to_export)
+        export_outputs(
+            args.output,
+            rasters_to_export,
+            vectors_to_export,
+            clip_boundary_path=str(watershed_utm_path),
+            geojsons_to_export={"mws_connectivity": connectivity_geojson},
+        )
 
     with timed("GRASS session shutdown", stage_timings):
         if session:

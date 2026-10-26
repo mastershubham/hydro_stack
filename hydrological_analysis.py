@@ -315,6 +315,8 @@ def dem_preprocessing(
     print(dem_in)
 
     filled_dem = rd.FillDepressions(dem_in, in_place=False)
+    filled_dem.geotransform = dem_in.geotransform
+    filled_dem.projection = dem_in.projection
 
     dem_arr = np.asarray(dem_in)
     filled_arr = np.asarray(filled_dem)

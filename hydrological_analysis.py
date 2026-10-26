@@ -273,12 +273,10 @@ def dem_preprocessing(
 
     conditioned_dem = str(Path(output_dir) / "dem_conditioned.tif")
     depression_tif = str(Path(output_dir) / "natural_depressions.tif")
-    analysis_dem = input_dem
 
     with rasterio.open(input_dem) as src:
         nodata = src.nodata
         crs = src.crs
-        profile = src.profile.copy()
         analysis_transform = src.transform
 
     if nodata is None:
@@ -308,17 +306,12 @@ def dem_preprocessing(
                 filled=True,
             )
             analysis_transform = transform
-            profile.update(
-                height=dem_data.shape[1],
-                width=dem_data.shape[2],
-                transform=transform,
-                nodata=nodata,
-            )
-        analysis_dem = str(Path(output_dir) / "dem_analysis_buffer.tif")
-        with rasterio.open(analysis_dem, "w", **profile) as dst:
-            dst.write(dem_data)
+        dem_in = rd.rdarray(dem_data[0], no_data=float(nodata))
+        dem_in.geotransform = transform
+        dem_in.projection = crs.to_wkt()
+    else:
+        dem_in = rd.LoadGDAL(input_dem, no_data=float(nodata))
 
-    dem_in = rd.LoadGDAL(analysis_dem, no_data=float(nodata))
     print(dem_in)
 
     filled_dem = rd.FillDepressions(dem_in, in_place=False)
@@ -942,7 +935,12 @@ def compute_catchments_with_stream_order(
     print(f"'{output_rast}' ready: each cell = Strahler order of its draining segment.")
     return output_rast
 
-def filter_vector_file_by_boundary(vector_path: Path, boundary_path: str) -> None:
+def filter_vector_file_by_boundary(
+    vector_path: Path,
+    boundary_path: str,
+    *,
+    require_majority_area: bool = False,
+) -> None:
     import geopandas as gpd
 
     # GRASS can export zero-length stream segments as one-coordinate LineStrings.
@@ -969,8 +967,52 @@ def filter_vector_file_by_boundary(vector_path: Path, boundary_path: str) -> Non
             f"from {vector_path}"
         )
     vectors = vectors[vectors.geometry.notna()].copy()
-    vectors = vectors[vectors.geometry.intersects(selection_geometry)]
+    if require_majority_area:
+        area_vectors = vectors
+        area_selection_geometry = selection_geometry
+        if vectors.crs.is_geographic:
+            area_crs = vectors.estimate_utm_crs()
+            if area_crs is None:
+                raise ValueError(
+                    f"Cannot estimate a projected CRS to compare feature areas: "
+                    f"{vector_path}"
+                )
+            area_vectors = vectors.to_crs(area_crs)
+            area_selection_geometry = (
+                boundary.to_crs(area_crs).geometry.union_all()
+            )
+        overlap_areas = area_vectors.geometry.intersection(
+            area_selection_geometry
+        ).area
+        vectors = vectors[overlap_areas > area_vectors.geometry.area / 2]
+    else:
+        vectors = vectors[vectors.geometry.intersects(selection_geometry)]
     vectors.to_file(vector_path, driver="GeoJSON")
+
+
+def smooth_micro_watershed_boundaries(
+    gs,
+    input_vector: str,
+    output_vector: str,
+) -> str:
+    """Apply conservative Chaiken smoothing to GRASS area boundaries."""
+    region = gs.region()
+    cell_width = abs(float(region["ewres"]))
+    cell_height = abs(float(region["nsres"]))
+    tolerance = math.hypot(cell_width, cell_height) / 2
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("GRASS region must have positive finite cell dimensions")
+
+    gs.run_command(
+        "v.generalize",
+        input=input_vector,
+        output=output_vector,
+        type="area",
+        method="chaiken",
+        threshold=tolerance,
+        overwrite=True,
+    )
+    return output_vector
 
 
 def export_outputs(
@@ -979,6 +1021,7 @@ def export_outputs(
     vectors_to_export: dict,
     clip_boundary_path: str | None = None,
     geojsons_to_export: dict | None = None,
+    majority_area_vectors: set[str] | None = None,
 ):
     import grass.script as gs
 
@@ -1016,7 +1059,14 @@ def export_outputs(
                    type=geom_type,
                    overwrite=True)
         if clip_boundary_path is not None:
-            filter_vector_file_by_boundary(output_path, clip_boundary_path)
+            filter_vector_file_by_boundary(
+                output_path,
+                clip_boundary_path,
+                require_majority_area=(
+                    majority_area_vectors is not None
+                    and name in majority_area_vectors
+                ),
+            )
         print(f"Exported vector: {output_path}")
 
     for name, geojson in (geojsons_to_export or {}).items():
@@ -1335,6 +1385,12 @@ def main():
         update_watershed_attributes(gs, edges, basin_centroids, basin_ids)
         print("Watershed attributes updated: downstream_id, upstream_ids, flow_direction -> 'watersheds_vect'")
 
+        smoothed_watersheds_vect = smooth_micro_watershed_boundaries(
+            gs,
+            input_vector="watersheds_vect",
+            output_vector="watersheds_vect_smoothed",
+        )
+
         gs.run_command("r.mask", flags="r")
         gs.run_command(
             "g.region",
@@ -1355,13 +1411,14 @@ def main():
         vectors_to_export = {
                 "streams":              ("streams_with_order", "line"),
                 "pour_points":          (pour_points_vect,  "point"),
-                "microwatersheds":      ("watersheds_vect", "area"),
+                "microwatersheds":      (smoothed_watersheds_vect, "area"),
             }
         export_outputs(
             args.output,
             rasters_to_export,
             vectors_to_export,
             clip_boundary_path=str(watershed_utm_path),
+            majority_area_vectors={"microwatersheds"},
             geojsons_to_export={"mws_connectivity": connectivity_geojson},
         )
 

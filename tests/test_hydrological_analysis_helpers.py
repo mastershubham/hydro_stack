@@ -142,11 +142,83 @@ def test_filter_vector_file_by_boundary_assigns_missing_boundary_crs(
     assert filtered.geometry.iloc[0].equals(LineString([(-1, 1), (3, 1)]))
 
 
+def test_filter_vector_file_by_boundary_keeps_features_with_majority_area_inside(
+    tmp_path,
+):
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    import hydrological_analysis as ha
+
+    boundary_path = tmp_path / "watershed.geojson"
+    output_path = tmp_path / "microwatersheds.geojson"
+    crs = "EPSG:32631"
+    gpd.GeoDataFrame(
+        geometry=[box(500000, 0, 502000, 2000)],
+        crs=crs,
+    ).to_file(boundary_path)
+    gpd.GeoDataFrame(
+        {"mws_id": [1, 2, 3, 4]},
+        geometry=[
+            box(500500, 500, 501000, 1000),
+            box(501400, 1000, 502400, 1500),
+            box(501500, 1000, 502500, 1500),
+            box(503000, 3000, 504000, 4000),
+        ],
+        crs=crs,
+    ).to_file(output_path)
+
+    ha.filter_vector_file_by_boundary(
+        output_path,
+        str(boundary_path),
+        require_majority_area=True,
+    )
+
+    filtered = gpd.read_file(output_path)
+    assert filtered["mws_id"].tolist() == [1, 2]
+
+
+def test_smooth_micro_watershed_boundaries_uses_half_cell_diagonal():
+    import math
+
+    import hydrological_analysis as ha
+
+    class FakeGrass:
+        def __init__(self):
+            self.commands = []
+
+        def region(self):
+            return {"ewres": 30, "nsres": 20}
+
+        def run_command(self, command, **kwargs):
+            self.commands.append((command, kwargs))
+
+    gs = FakeGrass()
+    output = ha.smooth_micro_watershed_boundaries(
+        gs,
+        input_vector="watersheds_vect",
+        output_vector="watersheds_vect_smoothed",
+    )
+
+    assert output == "watersheds_vect_smoothed"
+    assert gs.commands == [(
+        "v.generalize",
+        {
+            "input": "watersheds_vect",
+            "output": "watersheds_vect_smoothed",
+            "type": "area",
+            "method": "chaiken",
+            "threshold": math.hypot(30, 20) / 2,
+            "overwrite": True,
+        },
+    )]
+
+
 def test_dem_preprocessing_limits_depressions_to_watershed(tmp_path, monkeypatch):
     import geopandas as gpd
     import numpy as np
     import rasterio
-    from rasterio.transform import from_origin
+    from rasterio.transform import Affine, from_origin
     from shapely.geometry import box
     from types import SimpleNamespace
 
@@ -193,11 +265,13 @@ def test_dem_preprocessing_limits_depressions_to_watershed(tmp_path, monkeypatch
             return FakeRaster(src.read(1), no_data)
 
     def save_gdal(path, raster):
+        saved_geotransforms.append(raster.geotransform)
         with rasterio.open(input_dem) as src:
             output_profile = src.profile.copy()
         with rasterio.open(path, "w", **output_profile) as dst:
             dst.write(np.asarray(raster, dtype=np.float32), 1)
 
+    saved_geotransforms = []
     fake_richdem = SimpleNamespace(
         LoadGDAL=load_gdal,
         FillDepressions=lambda raster, in_place: FakeRaster(
@@ -226,6 +300,9 @@ def test_dem_preprocessing_limits_depressions_to_watershed(tmp_path, monkeypatch
     assert np.all(depressions[[0, 3], :] == profile["nodata"])
     assert np.all(depressions[:, [0, 3]] == profile["nodata"])
     assert np.all(conditioned != profile["nodata"])
+    assert not (tmp_path / "dem_analysis_buffer.tif").exists()
+    assert all(isinstance(transform, Affine) for transform in saved_geotransforms)
+    assert all(transform == profile["transform"] for transform in saved_geotransforms)
 
 
 def test_compute_mws_connectivity_exports_attribute_only_geojson(tmp_path, monkeypatch):
